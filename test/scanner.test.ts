@@ -81,7 +81,7 @@ function check(reading: Reading, fixture: Fixture): void {
 	for (const [key, piece] of expected.pieces) {
 		const [x, y] = key.split(',').map(Number) as [number, number];
 		const [rx, ry] = [x + dx, y + dy];
-		if (rx < area.left || rx > area.right || ry < area.bottom || ry > area.top) continue;
+		if (!reading.shown.has(`${rx},${ry}`)) continue;
 		assert.equal(read.pieces.get(`${rx},${ry}`), piece, `Piece at ${key}`);
 	}
 	for (const [key, piece] of read.pieces) {

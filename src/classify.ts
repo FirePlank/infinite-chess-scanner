@@ -5,14 +5,23 @@
  */
 
 import type { RGB } from './color.js';
-import type { Square } from './grid.js';
-import type { Fit, Matcher } from './matcher.js';
+import type { Fit, Matcher, SampledSquare, SizeClass } from './matcher.js';
 import type { Picture } from './picture.js';
 import type { Piece } from './pieces.js';
 import type { MipLevel } from './sprites.js';
+import type { Square, View } from './view.js';
 
 import { colorDistance, luminance } from './color.js';
-import { fitTemplate, glowAt, isPlain, meanColor, patchSums, rankFits } from './matcher.js';
+import { project } from './homography.js';
+import {
+	fitTemplate,
+	glowAt,
+	innerMask,
+	isPlain,
+	meanColor,
+	patchSums,
+	rankFits,
+} from './matcher.js';
 import { royalCounterpart } from './pieces.js';
 import { sampleTexture, textureLod } from './sprites.js';
 
@@ -21,8 +30,18 @@ import { sampleTexture, textureLod } from './sprites.js';
 /** Everything classifying one screenshot's squares needs. */
 export interface Reader {
 	pic: Picture;
-	matcher: Matcher;
+	view: View;
 	darkTile: RGB;
+}
+
+/** The screen pixels a square is compared over at pixel level, and where each falls in it. */
+interface PixelSet {
+	indices: Int32Array;
+	u: Float32Array;
+	v: Float32Array;
+	/** The mipmap level the site samples the square's piece at. */
+	lod: number;
+	size: number;
 }
 
 /** What one square holds. */
@@ -36,6 +55,9 @@ const PIECE_FIT_RATIO = 0.8;
 /** How many of a square's best-fitting pieces are compared again at pixel level. */
 const FINALIST_COUNT = 3;
 
+/** How many times worse than the best a candidate may fit and still be compared at pixel level. */
+const FINALIST_MARGIN = 1.5;
+
 /** Sub-pixel offsets the finalists are fit at, in pixels along each axis. */
 const ALIGNMENT_OFFSETS = [-0.3, -0.15, 0, 0.15, 0.3];
 
@@ -47,18 +69,27 @@ const CHECK_GLOW_REDNESS = 0.15;
 
 // Functions -------------------------------------------------------------------
 
-/** Decides what a square holds. */
-export function classify(reader: Reader, square: Square, patch: Float32Array): Verdict {
-	const { matcher, darkTile } = reader;
-	const mean = meanColor(patch, matcher.mask);
-	if (isPlain(patch, matcher.mask)) return backgroundVerdict(mean, darkTile);
+/** Decides what a square holds, from its patch compared at its size class. */
+export function classify(
+	reader: Reader,
+	{ square, sizeClass, patch }: SampledSquare,
+	matchers: (sizeClass: SizeClass) => Matcher,
+): Verdict {
+	const { darkTile } = reader;
+	const mask = innerMask(sizeClass.samples);
+	const mean = meanColor(patch, mask);
+	if (isPlain(patch, mask)) return backgroundVerdict(mean, darkTile);
+	const matcher = matchers(sizeClass);
 
 	const sums = patchSums(matcher, patch);
 	const ranked = rankFits(matcher, patch, sums);
 	const background = fitTemplate(matcher.empty, matcher, patch, sums);
 	if (ranked[0]!.residual > PIECE_FIT_RATIO * background.residual)
 		return backgroundVerdict(mean, darkTile);
-	const best = settle(reader, square, ranked.slice(0, FINALIST_COUNT));
+	const finalists = ranked
+		.slice(0, FINALIST_COUNT)
+		.filter((fit) => fit.residual <= FINALIST_MARGIN * ranked[0]!.residual);
+	const best = finalists.length > 1 ? settle(reader, square, finalists) : ranked[0]!;
 
 	const piece = best.template.sprite!.piece;
 	const royal = royalCounterpart(piece);
@@ -78,13 +109,14 @@ function backgroundVerdict(mean: RGB, darkTile: RGB): Verdict {
  * alignment that suits it best. Returns the winner's fit to the patch.
  */
 function settle(reader: Reader, square: Square, finalists: Fit[]): Fit {
+	const pixels = pixelsOf(reader.pic, reader.view, square);
 	let best: Fit | undefined;
 	let bestResidual = Infinity;
 	for (const fit of finalists) {
 		const levels = fit.template.sprite!.levels;
 		for (const dy of ALIGNMENT_OFFSETS) {
 			for (const dx of ALIGNMENT_OFFSETS) {
-				const residual = fitPixels(reader.pic, square, levels, dx, dy);
+				const residual = fitPixels(reader.pic, pixels, levels, dx, dy);
 				if (residual < bestResidual) {
 					bestResidual = residual;
 					best = fit;
@@ -95,59 +127,67 @@ function settle(reader: Reader, square: Square, finalists: Fit[]): Fit {
 	return best!;
 }
 
+/** The pixels a square is compared over: every few, within its margins. */
+function pixelsOf(pic: Picture, view: View, square: Square): PixelSet {
+	const { column, row, size } = square;
+	const margin = 1 / MAX_PIXELS_PER_SIDE + 0.5 / size;
+	const step = Math.max(1, Math.floor(size / MAX_PIXELS_PER_SIDE));
+	const corners = [project(view.toImage, column, row), project(view.toImage, column + 1, row), project(view.toImage, column, row + 1), project(view.toImage, column + 1, row + 1)]; // prettier-ignore
+	const left = Math.max(0, Math.floor(Math.min(...corners.map((p) => p[0]))));
+	const right = Math.min(pic.width - 1, Math.ceil(Math.max(...corners.map((p) => p[0]))));
+	const top = Math.max(0, Math.floor(Math.min(...corners.map((p) => p[1]))));
+	const bottom = Math.min(pic.height - 1, Math.ceil(Math.max(...corners.map((p) => p[1]))));
+	const indices: number[] = [];
+	const us: number[] = [];
+	const vs: number[] = [];
+	for (let py = top; py <= bottom; py += step) {
+		for (let px = left; px <= right; px += step) {
+			const [boardU, boardV] = project(view.toBoard, px + 0.5, py + 0.5);
+			const [u, v] = [boardU - column, boardV - row];
+			if (u < margin || v < margin || u > 1 - margin || v > 1 - margin) continue;
+			indices.push(py * pic.width + px);
+			us.push(u);
+			vs.push(v);
+		}
+	}
+	const [u, v] = [Float32Array.from(us), Float32Array.from(vs)];
+	return { indices: Int32Array.from(indices), u, v, lod: textureLod(size), size };
+}
+
 /**
  * The mean residual of {@link fitTemplate}'s model at pixel level: the piece rendered at every
  * compared screen pixel's own position in the square, shifted by a sub-pixel offset, against the
- * raw pixels.
+ * raw pixels. The same pixels are compared at every offset, only the piece shifts.
  */
 function fitPixels(
 	pic: Picture,
-	square: Square,
+	pixels: PixelSet,
 	levels: MipLevel[],
-	dx: number,
-	dy: number,
+	offsetX: number,
+	offsetY: number,
 ): number {
-	const { size } = square;
-	const left = square.left + dx;
-	const top = square.top + dy;
-	const lod = textureLod(size);
-	const margin = size / MAX_PIXELS_PER_SIDE + 0.5;
-	const step = Math.max(1, Math.floor(size / MAX_PIXELS_PER_SIDE));
+	const [shiftU, shiftV] = [offsetX / pixels.size, offsetY / pixels.size];
 	const texel = new Float32Array(4);
 	let uu = 0;
 	let uv = 0;
 	let vv = 0;
 	let yy = 0;
-	let n = 0;
 	const uy: RGB = [0, 0, 0];
 	const vy: RGB = [0, 0, 0];
-	// The same pixels are compared at every offset, only the piece shifts.
-	for (
-		let py = Math.ceil(square.top + margin - 0.5);
-		py + 0.5 <= square.top + size - margin;
-		py += step
-	) {
-		for (
-			let px = Math.ceil(square.left + margin - 0.5);
-			px + 0.5 <= square.left + size - margin;
-			px += step
-		) {
-			if (px < 0 || py < 0 || px >= pic.width || py >= pic.height) continue;
-			const u = (px + 0.5 - left) / size;
-			const v = (py + 0.5 - top) / size;
-			sampleTexture(levels, lod, u, v, texel);
-			const background = 1 - texel[3]!;
-			const glow = background * glowAt(u, v);
-			uu += background * background;
-			uv += background * glow;
-			vv += glow * glow;
-			for (let c = 0; c < 3; c++) {
-				const y = pic.rgb[(py * pic.width + px) * 3 + c]! - texel[c]!;
-				uy[c]! += background * y;
-				vy[c]! += glow * y;
-				yy += y * y;
-			}
-			n++;
+	for (let p = 0; p < pixels.indices.length; p++) {
+		const [u, v] = [pixels.u[p]! - shiftU, pixels.v[p]! - shiftV];
+		sampleTexture(levels, pixels.lod, u, v, texel);
+		const background = 1 - texel[3]!;
+		const glow = background * glowAt(u, v);
+		uu += background * background;
+		uv += background * glow;
+		vv += glow * glow;
+		const at = pixels.indices[p]! * 3;
+		for (let c = 0; c < 3; c++) {
+			const y = pic.rgb[at + c]! - texel[c]!;
+			uy[c]! += background * y;
+			vy[c]! += glow * y;
+			yy += y * y;
 		}
 	}
 	const ridge = 1e-3 * (uu + 1);
@@ -158,5 +198,5 @@ function fitPixels(
 		const glowColor = ((uu + ridge) * vy[c]! - uv * uy[c]!) / det;
 		residual -= base * uy[c]! + glowColor * vy[c]!;
 	}
-	return residual / n;
+	return residual / pixels.indices.length;
 }

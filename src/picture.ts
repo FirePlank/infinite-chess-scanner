@@ -1,8 +1,11 @@
 /**
- * Loads a screenshot, and box-averages any rectangle of it exactly through a summed-area table.
+ * Loads a screenshot, and samples squares of the board out of it through the board's homography,
+ * box-averaging exactly through a summed-area table.
  */
 
 import type { RGB } from './color.js';
+import type { Homography } from './homography.js';
+import type { Square } from './view.js';
 
 import sharp from 'sharp';
 
@@ -32,13 +35,18 @@ export async function loadPicture(input: string | Buffer): Promise<Picture> {
 	const stride = (width + 1) * 3;
 	const sat = new Float64Array(stride * (height + 1));
 	for (let y = 0; y < height; y++) {
-		const rowSum: RGB = [0, 0, 0];
+		let r = 0;
+		let g = 0;
+		let b = 0;
 		for (let x = 0; x < width; x++) {
-			for (let c = 0; c < 3; c++) {
-				rowSum[c]! += rgb[(y * width + x) * 3 + c]!;
-				sat[(y + 1) * stride + (x + 1) * 3 + c] =
-					sat[y * stride + (x + 1) * 3 + c]! + rowSum[c]!;
-			}
+			const i = (y * width + x) * 3;
+			r += rgb[i]!;
+			g += rgb[i + 1]!;
+			b += rgb[i + 2]!;
+			const at = (y + 1) * stride + (x + 1) * 3;
+			sat[at] = sat[at - stride]! + r;
+			sat[at + 1] = sat[at - stride + 1]! + g;
+			sat[at + 2] = sat[at - stride + 2]! + b;
 		}
 	}
 	return { width, height, rgb, sat };
@@ -49,28 +57,39 @@ export function colorAt(pic: Picture, i: number): RGB {
 	return [pic.rgb[i * 3]!, pic.rgb[i * 3 + 1]!, pic.rgb[i * 3 + 2]!];
 }
 
-/** Box-averages a square of the image down to a samples x samples RGB patch. */
+/**
+ * Samples a square down to a samples x samples RGB patch, each sample the average of the screen
+ * rectangle its part of the square spans. Seen straight down that's exactly the part; at an angle,
+ * the rectangle around it.
+ */
 export function samplePatch(
 	pic: Picture,
-	left: number,
-	top: number,
-	size: number,
+	toImage: Homography,
+	square: Square,
 	samples: number,
 ): Float32Array {
+	const [h0, h1, h2, h3, h4, h5, h6, h7, h8] = toImage as [number, number, number, number, number, number, number, number, number]; // prettier-ignore
 	const patch = new Float32Array(samples * samples * 3);
-	const step = size / samples;
 	const corners = new Float64Array(12);
+	const half = 0.5 / samples;
 	for (let sy = 0; sy < samples; sy++) {
+		const v = square.row + (sy + 0.5) / samples;
 		for (let sx = 0; sx < samples; sx++) {
-			const x = left + sx * step;
-			const y = top + sy * step;
-			readSAT(pic, x, y, corners, 0);
-			readSAT(pic, x + step, y, corners, 3);
-			readSAT(pic, x, y + step, corners, 6);
-			readSAT(pic, x + step, y + step, corners, 9);
+			const u = square.column + (sx + 0.5) / samples;
+			const w = h6 * u + h7 * v + h8;
+			const x = (h0 * u + h1 * v + h2) / w;
+			const y = (h3 * u + h4 * v + h5) / w;
+			// Half the sample's extent on screen along each axis, from the homography's derivatives.
+			const spanX = (Math.abs(h0 - x * h6) + Math.abs(h1 - x * h7)) * (half / w);
+			const spanY = (Math.abs(h3 - y * h6) + Math.abs(h4 - y * h7)) * (half / w);
+			readSAT(pic, x - spanX, y - spanY, corners, 0);
+			readSAT(pic, x + spanX, y - spanY, corners, 3);
+			readSAT(pic, x - spanX, y + spanY, corners, 6);
+			readSAT(pic, x + spanX, y + spanY, corners, 9);
+			const area = 4 * spanX * spanY;
+			const at = (sy * samples + sx) * 3;
 			for (let c = 0; c < 3; c++) {
-				const sum = corners[9 + c]! - corners[3 + c]! - corners[6 + c]! + corners[c]!;
-				patch[(sy * samples + sx) * 3 + c] = sum / (step * step);
+				patch[at + c] = (corners[9 + c]! - corners[3 + c]! - corners[6 + c]! + corners[c]!) / area; // prettier-ignore
 			}
 		}
 	}

@@ -5,6 +5,7 @@
  */
 
 import type { RGB } from './color.js';
+import type { Square } from './view.js';
 import type { Sprite } from './sprites.js';
 
 import { renderSprite } from './sprites.js';
@@ -27,6 +28,20 @@ export interface Template {
 	vP: RGB;
 	/** Energy of the sprite color, all channels. */
 	PP: number;
+}
+
+/** Squares near enough in size on screen to share templates, rendered at their mean size. */
+export interface SizeClass {
+	size: number;
+	/** Samples per square side. */
+	samples: number;
+}
+
+/** A square's sampled patch, and the size class it's compared at. */
+export interface SampledSquare {
+	square: Square;
+	sizeClass: SizeClass;
+	patch: Float32Array;
 }
 
 /** Everything square fitting needs at one comparison resolution and blur. */
@@ -69,38 +84,76 @@ const BLUR_SIGMAS = [0, 0.25, 0.4, 0.55, 0.7, 0.85, 1, 1.2];
 /** How many busy squares the blur is chosen on. */
 const BLUR_PROBE_COUNT = 48;
 
+/** How many size classes divide each doubling of square size. */
+const SIZE_CLASSES_PER_OCTAVE = 8;
+
+/** Bounds of the samples per square side. Larger squares are averaged down to the max. */
+const MIN_SAMPLES = 8;
+const MAX_SAMPLES = 24;
+
 /** Radii of the check glow, in squares: solid inside the inner, fading out by the outer. */
 const GLOW_INNER_RADIUS = 0.3;
 const GLOW_OUTER_RADIUS = 0.65;
 
+// State -----------------------------------------------------------------------
+
+/** The masks of {@link innerMask}, by sample count. */
+const MASKS = new Map<number, Uint8Array>();
+
 // Building --------------------------------------------------------------------
 
-/** Picks the blur whose templates best explain a spread of the busy squares. */
-export function chooseMatcher(
+/** Groups squares into size classes, each rendered at the mean size of its squares. */
+export function sizeClassesOf(squares: Square[]): Map<Square, SizeClass> {
+	const groups = new Map<number, Square[]>();
+	for (const square of squares) {
+		const key = Math.round(Math.log2(square.size) * SIZE_CLASSES_PER_OCTAVE);
+		const group = groups.get(key);
+		if (group) group.push(square);
+		else groups.set(key, [square]);
+	}
+	const classes = new Map<Square, SizeClass>();
+	for (const members of groups.values()) {
+		const size = members.reduce((sum, square) => sum + square.size, 0) / members.length;
+		const sizeClass = { size, samples: Math.min(MAX_SAMPLES, Math.max(MIN_SAMPLES, Math.round(size))) }; // prettier-ignore
+		for (const square of members) classes.set(square, sizeClass);
+	}
+	return classes;
+}
+
+/**
+ * Picks the blur that best explains a spread of the busy squares, and returns each size class's
+ * templates at it, built when first asked for. One blur fits the whole screenshot, as it comes
+ * from how the screenshot was resampled.
+ */
+export function chooseMatchers(
 	sprites: Sprite[],
-	squareSize: number,
-	samples: number,
-	patches: Float32Array[],
-): Matcher {
-	const mask = innerMask(samples);
-	const busy = patches.filter((patch) => !isPlain(patch, mask));
+	sampled: SampledSquare[],
+): (sizeClass: SizeClass) => Matcher {
+	const busy = sampled.filter(({ sizeClass, patch }) => !isPlain(patch, innerMask(sizeClass.samples))); // prettier-ignore
 	const stride = Math.max(1, Math.floor(busy.length / BLUR_PROBE_COUNT));
 	const probes = busy.filter((_, index) => index % stride === 0);
 
-	const renders = sprites.map((sprite) => renderSprite(sprite.levels, squareSize, samples));
-	let best: Matcher | undefined;
-	let bestScore = Infinity;
+	const renders = new Map<SizeClass, Float32Array[]>();
+	const build = (sizeClass: SizeClass, sigma: number): Matcher => {
+		if (!renders.has(sizeClass)) renders.set(sizeClass, sprites.map((sprite) => renderSprite(sprite.levels, sizeClass.size, sizeClass.samples))); // prettier-ignore
+		return buildMatcher(sprites, renders.get(sizeClass)!, sizeClass.samples, sigma);
+	};
+	let best = { sigma: 0, score: Infinity, matchers: new Map<SizeClass, Matcher>() };
 	for (const sigma of BLUR_SIGMAS) {
-		const matcher = buildMatcher(sprites, renders, samples, sigma);
+		const matchers = new Map<SizeClass, Matcher>();
 		let score = 0;
-		for (const patch of probes)
+		for (const { sizeClass, patch } of probes) {
+			if (!matchers.has(sizeClass)) matchers.set(sizeClass, build(sizeClass, sigma));
+			const matcher = matchers.get(sizeClass)!;
 			score += rankFits(matcher, patch, patchSums(matcher, patch))[0]!.residual;
-		if (score < bestScore) {
-			bestScore = score;
-			best = matcher;
 		}
+		if (score < best.score) best = { sigma, score, matchers };
 	}
-	return best!;
+	return (sizeClass) => {
+		if (!best.matchers.has(sizeClass))
+			best.matchers.set(sizeClass, build(sizeClass, best.sigma));
+		return best.matchers.get(sizeClass)!;
+	};
 }
 
 /** Builds every piece's template from its render, at a blur. */
@@ -119,9 +172,12 @@ function buildMatcher(
 	return { samples, mask, glow, templates, empty };
 }
 
-/** Every sample of a square but its outer ring. */
+/** Every sample of a square but its outer ring, kept per sample count. */
 export function innerMask(samples: number): Uint8Array {
+	const kept = MASKS.get(samples);
+	if (kept) return kept;
 	const mask = new Uint8Array(samples * samples);
+	MASKS.set(samples, mask);
 	for (let y = 1; y < samples - 1; y++)
 		for (let x = 1; x < samples - 1; x++) mask[y * samples + x] = 1;
 	return mask;

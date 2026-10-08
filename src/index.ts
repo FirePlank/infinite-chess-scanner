@@ -10,22 +10,33 @@
 
 import type { PlacedPiece, Promotion, WorldBorder } from './icn.js';
 import type { Reader } from './classify.js';
+import type { SampledSquare } from './matcher.js';
+import type { Picture } from './picture.js';
 import type { Sprite } from './sprites.js';
+import type { Square, View } from './view.js';
 
 import { classify } from './classify.js';
 import { writeIcn } from './icn.js';
+import { findViews } from './view.js';
 import { abbreviate, VOID_CODE } from './pieces.js';
-import { loadPicture } from './picture.js';
+import { loadPicture, samplePatch } from './picture.js';
 import { findTileColors } from './tiles.js';
 import { loadSprites } from './sprites.js';
-import { chooseMatcher, innerMask } from './matcher.js';
-import { findGrid, samplePatches, squareAt } from './grid.js';
+import {
+	chooseMatchers,
+	innerMask,
+	isPlain,
+	patchSums,
+	rankFits,
+	sizeClassesOf,
+} from './matcher.js';
 import {
 	fileOf,
 	findBoardExtent,
 	findDarkParity,
 	findPromotionLines,
 	frameOf,
+	isWithin,
 	rankOf,
 	readPromotion,
 	readWorldBorder,
@@ -49,19 +60,25 @@ export interface Reading {
 	promotion?: Promotion;
 	/** The world border, on the sides where the board ends within the screenshot. */
 	worldBorder?: WorldBorder;
-	/** The inclusive area of the board the screenshot fully shows. */
+	/** Every board square read, as `x,y`. The rest are off screen, too small to read, or beyond a world border. */
+	shown: Set<string>;
+	/** The bounding box of every square on screen large enough to read, world border or not. */
 	area: { left: number; right: number; bottom: number; top: number };
-	/** The size of a square, in pixels. */
+	/** The size of the largest square read, in pixels. Seen straight down, every square's. */
 	squareSize: number;
+	/** Whether the board is seen at an angle. */
+	perspective: boolean;
 }
 
 export type { PlacedPiece, Promotion, WorldBorder } from './icn.js';
 
 // Constants -------------------------------------------------------------------
 
-/** Bounds of the samples per square side. Larger squares are box-averaged down to the max. */
-const MIN_SAMPLES = 8;
-const MAX_SAMPLES = 24;
+/** How many of the largest squares are searched for pieces to tell the board's orientation by. */
+const ORIENTATION_SEARCH = 400;
+
+/** How many pieces tell the board's orientation. */
+const ORIENTATION_PIECES = 24;
 
 // State -----------------------------------------------------------------------
 
@@ -81,40 +98,81 @@ export async function readScreenshot(
 	sprites ??= loadSprites();
 	const pic = await loadPicture(input);
 	const tiles = findTileColors(pic);
-	const grid = findGrid(pic, tiles);
-
-	const samples = Math.min(MAX_SAMPLES, Math.max(MIN_SAMPLES, Math.round(grid.size)));
-	const patches = samplePatches(pic, grid, samples);
-	const extent = findBoardExtent(patches, tiles);
-	const onBoard = patches
-		.slice(extent.top, extent.bottom + 1)
-		.map((line) => line.slice(extent.left, extent.right + 1));
-	const matcher = chooseMatcher(await sprites, grid.size, samples, onBoard.flat());
-	const reader: Reader = { pic, matcher, darkTile: tiles[0] };
-	const darkParity = findDarkParity(onBoard, tiles, innerMask(samples));
-	const flipped = options.perspective === 'black';
-	const frame = frameOf(grid, (darkParity + extent.left + extent.top) % 2, flipped);
+	const view = chooseView(pic, findViews(pic, tiles), await sprites);
+	const sampled = sampleSquares(pic, view, view.squares);
+	const extent = findBoardExtent(sampled, tiles);
+	const onBoard = sampled
+		.filter(({ square }) => isWithin(square, extent))
+		.sort((a, b) => a.square.row - b.square.row || a.square.column - b.square.column);
+	const matchers = chooseMatchers(await sprites, onBoard);
+	const reader: Reader = { pic, view, darkTile: tiles[0] };
+	const frame = frameOf(view.squares, findDarkParity(onBoard, tiles), options.perspective === 'black'); // prettier-ignore
 
 	const pieces: PlacedPiece[] = [];
-	for (let row = extent.top; row <= extent.bottom; row++) {
-		for (let column = extent.left; column <= extent.right; column++) {
-			const verdict = classify(reader, squareAt(grid, column, row), patches[row]![column]!);
-			if (verdict.kind === 'empty') continue;
-			const abbreviation = verdict.kind === 'void' ? VOID_CODE : abbreviate(verdict.piece);
-			pieces.push({ abbreviation, x: fileOf(frame, column), y: rankOf(frame, row) });
-		}
+	for (const sampled of onBoard) {
+		const { square } = sampled;
+		const verdict = classify(reader, sampled, matchers);
+		if (verdict.kind === 'empty') continue;
+		const abbreviation = verdict.kind === 'void' ? VOID_CODE : abbreviate(verdict.piece);
+		pieces.push({
+			abbreviation,
+			x: fileOf(frame, square.column),
+			y: rankOf(frame, square.row),
+		});
 	}
 
-	const promotion = readPromotion(findPromotionLines(pic, grid, tiles), frame);
-	const worldBorder = readWorldBorder(extent, grid, frame);
-	const [x0, x1] = [fileOf(frame, 0), fileOf(frame, grid.x.count - 1)];
-	const [y0, y1] = [rankOf(frame, grid.y.count - 1), rankOf(frame, 0)];
+	const promotion = readPromotion(findPromotionLines(pic, view, view.squares, tiles), frame);
+	const worldBorder = readWorldBorder(extent, view.squares, frame);
+	const shown = new Set(onBoard.map(({ square }) => `${fileOf(frame, square.column)},${rankOf(frame, square.row)}`)); // prettier-ignore
+	const coordinates = view.squares.map((square): [number, number] => [fileOf(frame, square.column), rankOf(frame, square.row)]); // prettier-ignore
 	const area = {
-		left: Math.min(x0, x1),
-		right: Math.max(x0, x1),
-		bottom: Math.min(y0, y1),
-		top: Math.max(y0, y1),
+		left: Math.min(...coordinates.map(([x]) => x)),
+		right: Math.max(...coordinates.map(([x]) => x)),
+		bottom: Math.min(...coordinates.map(([, y]) => y)),
+		top: Math.max(...coordinates.map(([, y]) => y)),
 	};
+	const squareSize = Math.max(...view.squares.map((square) => square.size));
 	const icn = writeIcn(pieces, promotion, worldBorder);
-	return { icn, pieces, promotion, worldBorder, area, squareSize: grid.size };
+	return {
+		icn,
+		pieces,
+		promotion,
+		worldBorder,
+		shown,
+		area,
+		squareSize,
+		perspective: view.perspective,
+	};
+}
+
+/** Samples squares, each at the resolution of its size class. */
+function sampleSquares(pic: Picture, view: View, squares: Square[]): SampledSquare[] {
+	const sizeClasses = sizeClassesOf(squares);
+	return squares.map((square) => {
+		const sizeClass = sizeClasses.get(square)!;
+		return {
+			square,
+			sizeClass,
+			patch: samplePatch(pic, view.toImage, square, sizeClass.samples),
+		};
+	});
+}
+
+/** Of the ways the board might sit, the one its largest pieces fit best standing as drawn. */
+function chooseView(pic: Picture, views: View[], sprites: Sprite[]): View {
+	if (views.length === 1) return views[0]!;
+	const scores = views.map((view) => {
+		const largest = [...view.squares]
+			.sort((a, b) => b.size - a.size)
+			.slice(0, ORIENTATION_SEARCH);
+		const busy = sampleSquares(pic, view, largest)
+			.filter(({ sizeClass, patch }) => !isPlain(patch, innerMask(sizeClass.samples)))
+			.slice(0, ORIENTATION_PIECES);
+		const matchers = chooseMatchers(sprites, busy);
+		return busy.reduce((sum, { sizeClass, patch }) => {
+			const matcher = matchers(sizeClass);
+			return sum + rankFits(matcher, patch, patchSums(matcher, patch))[0]!.residual;
+		}, 0);
+	});
+	return views[scores.indexOf(Math.min(...scores))]!;
 }

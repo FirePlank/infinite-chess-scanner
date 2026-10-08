@@ -114,6 +114,23 @@ export function isTileColor(color: RGB, [dark, light]: Tiles): boolean {
 	);
 }
 
+/** Each pixel's position from the dark (0) to the light (1) tile color, or NaN if it's neither. */
+export function tileShades(pic: Picture, [dark, light]: Tiles): Float32Array {
+	const [ar, ag, ab] = [light[0] - dark[0], light[1] - dark[1], light[2] - dark[2]];
+	const lengthSq = ar * ar + ag * ag + ab * ab;
+	const tolerance = 0.25 * Math.sqrt(lengthSq) + 0.02;
+	const shades = new Float32Array(pic.width * pic.height);
+	for (let i = 0; i < shades.length; i++) {
+		const r = pic.rgb[i * 3]! - dark[0];
+		const g = pic.rgb[i * 3 + 1]! - dark[1];
+		const b = pic.rgb[i * 3 + 2]! - dark[2];
+		const t = (r * ar + g * ag + b * ab) / lengthSq;
+		const off = Math.hypot(r - t * ar, g - t * ag, b - t * ab);
+		shades[i] = off < tolerance && t > -0.25 && t < 1.25 ? t : NaN;
+	}
+	return shades;
+}
+
 /**
  * Where pixel i lies against the blend from the dark to the light tile color: how far along it,
  * from 0 at dark to 1 at light, and how far off it.

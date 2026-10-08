@@ -9,6 +9,8 @@ writes it as ICN, ready to paste back into the site.
 
 - **Any theme, any zoom**: finds the square grid from the board's own tiles, to a fraction of a
   pixel. No calibration, no cropping to exact squares.
+- **Perspective mode**: reads boards seen at an angle too, at any tilt and turn, by fitting the
+  board's projection from its checkerboard corners.
 - **Every piece**: all 21 piece types and voids, for white, black and neutral, plus the red, blue,
   yellow and green players.
 - **Pixel-exact matching**: renders each sprite the way the site's WebGL does, so pieces that differ
@@ -61,8 +63,10 @@ reading.icn; //         'w 1 (4|-3) r-3,4|n-2,4|b-1,4|...'
 reading.pieces; //      [{ abbreviation: 'r', x: -3, y: 4 }, ...]
 reading.promotion; //   { white: [4], black: [-3] }, or undefined
 reading.worldBorder; // { left, right, bottom, top }, null on open sides, or undefined
-reading.area; //        { left: -14, right: 15, bottom: -7, top: 8 }, the squares it fully shows
-reading.squareSize; //  50.53, in pixels
+reading.shown; //       Set { '-14,8', ... }, every board square read
+reading.area; //        { left: -14, right: 15, bottom: -7, top: 8 }, the box around them
+reading.squareSize; //  50.53, in pixels, of the largest square
+reading.perspective; // false, or true when the board is seen at an angle
 ```
 
 Install it into another project with `npm install github:FirePlank/infinite-chess-scanner`.
@@ -121,7 +125,9 @@ The board ends inside the screenshot on every side, so the world border `-3,4,-3
   implied.
 - **World borders**: read only on sides where the board ends inside the screenshot. A full row or
   column of voids along the screenshot's edge also looks like the board ending there.
-- **Squares under 6.5 pixels** are refused rather than guessed.
+- **Squares under 6.5 pixels** are refused rather than guessed. In perspective mode that's measured
+  across a square's narrower side, so the far part of the board is left unread, and only the squares
+  in `reading.shown` say anything about the position.
 - **What's drawn over the board**: arrows, annotations and legal move dots aren't understood, and
   can throw off the squares under them. Move highlights are fine.
 - **Black's side** must be asked for with `--black`. Without it, the position reads rotated 180°.
@@ -136,10 +142,10 @@ The board ends inside the screenshot on every side, so the world border `-3,4,-3
 npm test
 ```
 
-Reads 30 screenshots of the site and checks each against the true position up to translation:
+Reads 38 screenshots of the site and checks each against the true position up to translation:
 pieces, voids, promotion ranks and world border. They cover the 18 standard variants, zoom levels
-down to 7-pixel squares, two board themes, royals in check and black's side. One more, zoomed out
-too far, must be refused.
+down to 7-pixel squares, two board themes, royals in check, black's side, and perspective mode at
+several tilts and turns. One more, zoomed out too far, must be refused.
 
 ---
 

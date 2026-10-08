@@ -1,14 +1,9 @@
 /**
- * Locates the square grid from the edges between the two tile colors, to a negligible fraction
- * of a pixel, and samples every fully visible square.
+ * Locates the square grid of a board seen straight down from the edges between the two tile
+ * colors, to a negligible fraction of a pixel.
  */
 
 import type { Picture } from './picture.js';
-import type { Tiles } from './tiles.js';
-
-import { colorDistance } from './color.js';
-import { samplePatch } from './picture.js';
-import { projectOntoTiles } from './tiles.js';
 
 // Types -----------------------------------------------------------------------
 
@@ -25,44 +20,22 @@ export interface Grid {
 	y: Axis;
 }
 
-/** One square's bounds in the image, in pixels. */
-export interface Square {
-	left: number;
-	top: number;
-	size: number;
-}
-
 // Constants -------------------------------------------------------------------
 
-/** Smallest square size readable, in pixels. */
-const MIN_SQUARE_SIZE = 6.5;
-
 /** How far a square may poke out of the image and still count as fully visible, in pixels. */
-const EDGE_TOLERANCE = 0.75;
+export const EDGE_TOLERANCE = 0.75;
 
 // Grid ------------------------------------------------------------------------
 
 /**
  * Locates the square grid from the edges between the two tile colors.
- * @throws If there's no checkerboard, or its squares are too small to read.
+ * @throws If there's no checkerboard.
  */
-export function findGrid(pic: Picture, tiles: Tiles): Grid {
-	const [xEdges, yEdges] = edgeProfiles(pic, tileShades(pic, tiles));
+export function findGrid(pic: Picture, shades: Float32Array): Grid {
+	const [xEdges, yEdges] = edgeProfiles(pic, shades);
 	const maxSize = Math.min(pic.width, pic.height) / 2;
 	const size = refineSquareSize(xEdges, yEdges, coarseSquareSize(xEdges, yEdges, maxSize));
-	if (size < MIN_SQUARE_SIZE) throw new Error(`The squares are under ${MIN_SQUARE_SIZE}px, too small to read. Zoom in.`); // prettier-ignore
 	return { size, x: placeAxis(xEdges, size, pic.width), y: placeAxis(yEdges, size, pic.height) };
-}
-
-/** Each pixel's position from the dark (0) to the light (1) tile color, or NaN if it's neither. */
-function tileShades(pic: Picture, tiles: Tiles): Float32Array {
-	const tolerance = 0.25 * colorDistance(tiles[0], tiles[1]) + 0.02;
-	const shades = new Float32Array(pic.width * pic.height);
-	for (let i = 0; i < shades.length; i++) {
-		const [t, off] = projectOntoTiles(pic, i, tiles);
-		shades[i] = off < tolerance && t > -0.25 && t < 1.25 ? t : NaN;
-	}
-	return shades;
 }
 
 /** Total shade change across each vertical, and each horizontal, pixel boundary. */
@@ -166,29 +139,4 @@ function placeAxis(edges: Float64Array, size: number, length: number): Axis {
 	const origin = phase + Math.ceil((-EDGE_TOLERANCE - phase) / size) * size;
 	const count = Math.floor((length + EDGE_TOLERANCE - origin) / size);
 	return { origin, count };
-}
-
-// Squares ---------------------------------------------------------------------
-
-/** The bounds of the square in a column and row. */
-export function squareAt(grid: Grid, column: number, row: number): Square {
-	return {
-		left: grid.x.origin + column * grid.size,
-		top: grid.y.origin + row * grid.size,
-		size: grid.size,
-	};
-}
-
-/** Box-averages every fully visible square down to a samples x samples patch, indexed [row][column]. */
-export function samplePatches(pic: Picture, grid: Grid, samples: number): Float32Array[][] {
-	const patches: Float32Array[][] = [];
-	for (let row = 0; row < grid.y.count; row++) {
-		const line: Float32Array[] = [];
-		for (let column = 0; column < grid.x.count; column++) {
-			const { left, top, size } = squareAt(grid, column, row);
-			line.push(samplePatch(pic, left, top, size, samples));
-		}
-		patches.push(line);
-	}
-	return patches;
 }
