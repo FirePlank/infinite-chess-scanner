@@ -126,6 +126,18 @@ for (const fixture of fixtures) {
 	});
 }
 
+const obstacleOcean = fixtures.find((fixture) => fixture.image === 'obstocean.png')!;
+for (const [image, count] of [
+	['obstocean-crop-wide.png', 352],
+	['obstocean-crop-tight.png', 280],
+] as const) {
+	test(image, async () => {
+		const reading = await readScreenshot(fs.readFileSync(new URL(image, FIXTURES)));
+		check(reading, { ...obstacleOcean, promotionHidden: true });
+		assert.equal(reading.pieces.length, count, 'Every fully visible square must be read.');
+	});
+}
+
 test('rejects squares too small to read', async () => {
 	const file = new URL('space-too-far.png', FIXTURES);
 	await assert.rejects(readScreenshot(fs.readFileSync(file)), /too small to read/);

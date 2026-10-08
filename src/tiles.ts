@@ -18,10 +18,14 @@ export type Tiles = [dark: RGB, light: RGB];
 const TILE_TOLERANCE = 0.05;
 
 /**
- * How far diagonally from a checkerboard corner its four squares' colors are read, in pixels.
- * Near enough to fit beside obstacles, and far enough to clear a blurred tile edge.
+ * Pixel offsets before and after a checkerboard corner. Immediate neighbors fit beside small
+ * obstacles; wider stencils clear blurred tile edges.
  */
-const CORNER_REACHES = [1, 2];
+const CORNER_REACHES = [
+	[1, 0],
+	[1, 1],
+	[2, 2],
+] as const;
 
 /** How many color histogram bins there are, at 6 bits per channel. */
 const BIN_COUNT = 1 << 18;
@@ -62,15 +66,16 @@ function countCorners(
 	bins: Uint32Array,
 	width: number,
 	height: number,
-	reach: number,
+	reach: readonly [number, number],
 	votes: Map<number, number>,
 ): void {
-	for (let y = reach; y < height - reach; y++) {
-		for (let x = reach; x < width - reach; x++) {
-			const a = bins[(y - reach) * width + x - reach]!;
-			const b = bins[(y - reach) * width + x + reach]!;
-			if (a === b || bins[(y + reach) * width + x + reach] !== a) continue;
-			if (bins[(y + reach) * width + x - reach] !== b) continue;
+	const [before, after] = reach;
+	for (let y = before; y < height - after; y++) {
+		for (let x = before; x < width - after; x++) {
+			const a = bins[(y - before) * width + x - before]!;
+			const b = bins[(y - before) * width + x + after]!;
+			if (a === b || bins[(y + after) * width + x + after] !== a) continue;
+			if (bins[(y + after) * width + x - before] !== b) continue;
 			const pair = Math.min(a, b) * BIN_COUNT + Math.max(a, b);
 			votes.set(pair, (votes.get(pair) ?? 0) + 1);
 		}

@@ -112,6 +112,7 @@ function fitPixels(
 	const top = square.top + dy;
 	const lod = textureLod(size);
 	const margin = size / MAX_PIXELS_PER_SIDE + 0.5;
+	// Compare the same pixels at every alignment; only the texture coordinates shift.
 	const step = Math.max(1, Math.floor(size / MAX_PIXELS_PER_SIDE));
 	const texel = new Float32Array(4);
 	let uu = 0;
@@ -121,10 +122,14 @@ function fitPixels(
 	let n = 0;
 	const uy: RGB = [0, 0, 0];
 	const vy: RGB = [0, 0, 0];
-	for (let py = Math.ceil(top + margin - 0.5); py + 0.5 <= top + size - margin; py += step) {
+	for (
+		let py = Math.ceil(square.top + margin - 0.5);
+		py + 0.5 <= square.top + size - margin;
+		py += step
+	) {
 		for (
-			let px = Math.ceil(left + margin - 0.5);
-			px + 0.5 <= left + size - margin;
+			let px = Math.ceil(square.left + margin - 0.5);
+			px + 0.5 <= square.left + size - margin;
 			px += step
 		) {
 			if (px < 0 || py < 0 || px >= pic.width || py >= pic.height) continue;
