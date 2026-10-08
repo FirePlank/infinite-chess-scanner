@@ -10,26 +10,18 @@
 
 import type { PlacedPiece, Promotion, WorldBorder } from './icn.js';
 import type { Reader } from './classify.js';
-import type { SampledSquare } from './matcher.js';
 import type { Picture } from './picture.js';
 import type { Sprite } from './sprites.js';
-import type { Square, View } from './view.js';
+import type { View } from './view.js';
 
 import { classify } from './classify.js';
 import { writeIcn } from './icn.js';
 import { findViews } from './view.js';
 import { abbreviate, VOID_CODE } from './pieces.js';
-import { loadPicture, samplePatch } from './picture.js';
+import { loadPicture } from './picture.js';
 import { findTileColors } from './tiles.js';
 import { loadSprites } from './sprites.js';
-import {
-	chooseMatchers,
-	innerMask,
-	isPlain,
-	patchSums,
-	rankFits,
-	sizeClassesOf,
-} from './matcher.js';
+import { chooseMatchers, isBusy, patchSums, rankFits, sampleSquares } from './matcher.js';
 import {
 	fileOf,
 	findBoardExtent,
@@ -99,7 +91,7 @@ export async function readScreenshot(
 	const pic = await loadPicture(input);
 	const tiles = findTileColors(pic);
 	const view = chooseView(pic, findViews(pic, tiles), await sprites);
-	const sampled = sampleSquares(pic, view, view.squares);
+	const sampled = sampleSquares(pic, view.pieces.toImage, view.squares);
 	const extent = findBoardExtent(sampled, tiles);
 	const onBoard = sampled
 		.filter(({ square }) => isWithin(square, extent))
@@ -145,19 +137,6 @@ export async function readScreenshot(
 	};
 }
 
-/** Samples squares, each at the resolution of its size class. */
-function sampleSquares(pic: Picture, view: View, squares: Square[]): SampledSquare[] {
-	const sizeClasses = sizeClassesOf(squares);
-	return squares.map((square) => {
-		const sizeClass = sizeClasses.get(square)!;
-		return {
-			square,
-			sizeClass,
-			patch: samplePatch(pic, view.toImage, square, sizeClass.samples),
-		};
-	});
-}
-
 /** Of the ways the board might sit, the one its largest pieces fit best standing as drawn. */
 function chooseView(pic: Picture, views: View[], sprites: Sprite[]): View {
 	if (views.length === 1) return views[0]!;
@@ -165,8 +144,8 @@ function chooseView(pic: Picture, views: View[], sprites: Sprite[]): View {
 		const largest = [...view.squares]
 			.sort((a, b) => b.size - a.size)
 			.slice(0, ORIENTATION_SEARCH);
-		const busy = sampleSquares(pic, view, largest)
-			.filter(({ sizeClass, patch }) => !isPlain(patch, innerMask(sizeClass.samples)))
+		const busy = sampleSquares(pic, view.pieces.toImage, largest)
+			.filter((square) => isBusy(square))
 			.slice(0, ORIENTATION_PIECES);
 		const matchers = chooseMatchers(sprites, busy);
 		return busy.reduce((sum, { sizeClass, patch }) => {

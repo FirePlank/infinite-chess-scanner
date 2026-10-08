@@ -13,8 +13,8 @@ import { EDGE_TOLERANCE, findGrid } from './grid.js';
 import { colorDistance } from './color.js';
 import { colorAt } from './picture.js';
 import { isTileColor, tileShades } from './tiles.js';
-import { findCorners, fitLattice } from './lattice.js';
-import { invert, isInFront, project, stretch } from './homography.js';
+import { findCorners, fitLattice, isCornerNear, tileClasses } from './lattice.js';
+import { invert, isInFront, project, raise, stretch } from './homography.js';
 
 // Types -----------------------------------------------------------------------
 
@@ -29,11 +29,17 @@ export interface Square {
 	size: number;
 }
 
-/** How the board's grid sits in a screenshot. */
-export interface View {
+/** How a plane on the board's grid sits in a screenshot. */
+export interface Plane {
 	/** Maps board-grid coordinates to image pixels: square (column, row) spans [column, column+1] x [row, row+1]. */
 	toImage: Homography;
 	toBoard: Homography;
+}
+
+/** How the board's grid sits in a screenshot. */
+export interface View extends Plane {
+	/** The plane the pieces are drawn on, just above the board's. */
+	pieces: Plane;
 	/** Every square fully on screen and large enough to read. */
 	squares: Square[];
 	/** Whether the board is seen at an angle. */
@@ -54,6 +60,12 @@ const MIN_CORNERS_TO_CHECK = 20;
 /** The fraction of a lattice's bare square centers that must alternate between the tile colors. */
 const CHECKERED_AGREEMENT = 0.9;
 
+/**
+ * How far above the board the site draws its pieces at an angle, as a fraction of its camera's
+ * height: pieces at 0.005, tiles at -0.01, the camera at 12.
+ */
+const PIECE_RISE = 0.015 / 12.01;
+
 /** The most squares read at an angle, which keeps a view toward the horizon bounded. */
 const MAX_SQUARES = 20000;
 
@@ -66,7 +78,7 @@ const MAX_SQUARES = 20000;
  */
 export function findViews(pic: Picture, tiles: Tiles): View[] {
 	const shades = tileShades(pic, tiles);
-	const corners = findCorners(pic, shades);
+	const classes = tileClasses(shades);
 	let grid: Grid | undefined;
 	let gridError: unknown;
 	try {
@@ -74,6 +86,8 @@ export function findViews(pic: Picture, tiles: Tiles): View[] {
 	} catch (error) {
 		gridError = error;
 	}
+	if (grid && areGridCornersShown(pic, classes, grid)) return [flatView(grid)];
+	const corners = findCorners(pic, classes);
 	if (grid && isGridOnCorners(grid, corners)) return [flatView(grid)];
 	const homographies = fitLattice(corners, pic.width, pic.height);
 	if (homographies) {
@@ -107,6 +121,23 @@ function tooSmall(): Error {
 	return new Error(`The squares are under ${MIN_SQUARE_SIZE}px, too small to read. Zoom in.`);
 }
 
+/**
+ * Whether most of a straight-down grid's inner corners show as checkerboard corners, which settles
+ * that the board is seen straight down without scanning the whole image for corners.
+ */
+function areGridCornersShown(pic: Picture, classes: Int8Array, grid: Grid): boolean {
+	let shown = 0;
+	let total = 0;
+	for (let row = 1; row < grid.y.count; row++) {
+		for (let column = 1; column < grid.x.count; column++) {
+			const [x, y] = [grid.x.origin + column * grid.size, grid.y.origin + row * grid.size];
+			if (isCornerNear(pic, classes, x, y)) shown++;
+			total++;
+		}
+	}
+	return total >= MIN_CORNERS_TO_CHECK && shown >= GRID_CORNER_AGREEMENT * total;
+}
+
 /** Whether a straight-down grid passes through the checkerboard's corners, as it does unless the board is seen at an angle. */
 function isGridOnCorners(grid: Grid, corners: Point[]): boolean {
 	if (corners.length < MIN_CORNERS_TO_CHECK) return true;
@@ -132,7 +163,8 @@ function flatView(grid: Grid): View {
 	for (let row = 0; row < grid.y.count; row++) {
 		for (let column = 0; column < grid.x.count; column++) squares.push({ column, row, size: grid.size }); // prettier-ignore
 	}
-	return { toImage, toBoard: invert(toImage), squares, perspective: false };
+	const toBoard = invert(toImage);
+	return { toImage, toBoard, pieces: { toImage, toBoard }, squares, perspective: false };
 }
 
 /**
@@ -162,7 +194,9 @@ function perspectiveView(pic: Picture, toImage: Homography): View {
 		}
 	}
 	if (squares.length === 0) throw tooSmall();
-	return { toImage, toBoard, squares, perspective: true };
+	const piecesToImage = raise(toImage, pic.width, pic.height, PIECE_RISE);
+	const pieces = { toImage: piecesToImage, toBoard: invert(piecesToImage) };
+	return { toImage, toBoard, pieces, squares, perspective: true };
 }
 
 /** A square, if it's fully on screen and large enough to read. */
@@ -179,7 +213,6 @@ function readableSquare(
 		[column, row + 1],
 		[column + 1, row + 1],
 	] as Point[]) {
-		// prettier-ignore
 		if (!isInFront(toImage, c, r)) return undefined;
 		const [x, y] = project(toImage, c, r);
 		const outside = x < -EDGE_TOLERANCE || y < -EDGE_TOLERANCE || x > pic.width + EDGE_TOLERANCE || y > pic.height + EDGE_TOLERANCE; // prettier-ignore

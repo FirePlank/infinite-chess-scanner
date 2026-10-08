@@ -11,7 +11,10 @@ export type RGB = [number, number, number];
 
 /** Euclidean distance between two colors. */
 export function colorDistance(a: RGB, b: RGB): number {
-	return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+	const dr = a[0] - b[0];
+	const dg = a[1] - b[1];
+	const db = a[2] - b[2];
+	return Math.sqrt(dr * dr + dg * dg + db * db);
 }
 
 /** Perceived brightness of a color. */

@@ -18,6 +18,7 @@ writes it as ICN, ready to paste back into the site.
 - **Highlights and checks**: a square's background is fitted rather than assumed, so move highlights
   don't get in the way, and the red glow of a royal in check marks it as royal.
 - **Promotion lines and world borders**: read wherever they show, and written into the ICN.
+- **Fast**: a few hundred milliseconds a screenshot, with several read at once across every core.
 
 ## Quick Start
 
@@ -106,6 +107,17 @@ w 1 -3,4,-3,4 r-3,4|n-2,4|b-1,4|q0,4|k1,4|b2,4|n3,4|r4,4|p-3,3|p-2,3|p-1,3|p0,3|
 
 The board ends inside the screenshot on every side, so the world border `-3,4,-3,4` is read too.
 
+### Perspective
+
+<img src="test/fixtures/persp-abundance-graze.png" alt="Abundance seen at a grazing angle in perspective mode" width="800" />
+
+```
+w 1 (-6|-18) p-21,-2|ha-20,-2|ha-19,-2|r-18,-2|ha-17,-2|ha-16,-2|p-15,-2|p-20,-3|p-19,-3|p-17,-3|p-16,-3|p-23,-6|gu-22,-6|r-21,-6|b-20,-6|b-19,-6|k-18,-6|b-17,-6|b-16,-6|r-15,-6|gu-14,-6|p-13,-6|p-22,-7|gu-21,-7|n-19,-7|q-18,-7|n-17,-7|gu-15,-7|p-14,-7|p-21,-8|p-20,-8|gu-19,-8|ch-18,-8|gu-17,-8|p-16,-8|p-15,-8|p-19,-9|p-18,-9|p-17,-9|P-19,-15|P-18,-15|P-17,-15|P-21,-16|P-20,-16|GU-19,-16|CH-18,-16|GU-17,-16|P-16,-16|P-15,-16|P-22,-17|GU-21,-17|N-19,-17|Q-18,-17|N-17,-17|GU-15,-17|P-14,-17|P-23,-18|GU-22,-18|R-21,-18|B-20,-18|B-19,-18|K-18,-18|B-17,-18|B-16,-18|R-15,-18|GU-14,-18|P-13,-18|P-20,-21|P-19,-21|P-17,-21|P-16,-21|P-21,-22|HA-20,-22|HA-19,-22|R-18,-22|HA-17,-22|HA-16,-22|P-15,-22
+```
+
+All 78 pieces of Abundance and both promotion lines, read at a grazing angle with the board turned
+sideways, the farthest on squares about 15 pixels across.
+
 ## Taking a Screenshot
 
 - Crop away the site's menus and bars. Anything covering the board's edge reads as the edge of the
@@ -142,7 +154,7 @@ The board ends inside the screenshot on every side, so the world border `-3,4,-3
 npm test
 ```
 
-Reads 38 screenshots of the site and checks each against the true position up to translation:
+Reads 39 screenshots of the site and checks each against the true position up to translation:
 pieces, voids, promotion ranks and world border. They cover the 18 standard variants, zoom levels
 down to 7-pixel squares, two board themes, royals in check, black's side, and perspective mode at
 several tilts and turns. One more, zoomed out too far, must be refused.

@@ -9,7 +9,7 @@ import type { Fit, Matcher, SampledSquare, SizeClass } from './matcher.js';
 import type { Picture } from './picture.js';
 import type { Piece } from './pieces.js';
 import type { MipLevel } from './sprites.js';
-import type { Square, View } from './view.js';
+import type { Plane, Square, View } from './view.js';
 
 import { colorDistance, luminance } from './color.js';
 import { project } from './homography.js';
@@ -72,13 +72,11 @@ const CHECK_GLOW_REDNESS = 0.15;
 /** Decides what a square holds, from its patch compared at its size class. */
 export function classify(
 	reader: Reader,
-	{ square, sizeClass, patch }: SampledSquare,
+	{ square, sizeClass, mean, patch }: SampledSquare,
 	matchers: (sizeClass: SizeClass) => Matcher,
 ): Verdict {
 	const { darkTile } = reader;
-	const mask = innerMask(sizeClass.samples);
-	const mean = meanColor(patch, mask);
-	if (isPlain(patch, mask)) return backgroundVerdict(mean, darkTile);
+	if (patch === undefined || isPlain(patch, innerMask(sizeClass.samples))) return backgroundVerdict(mean, darkTile); // prettier-ignore
 	const matcher = matchers(sizeClass);
 
 	const sums = patchSums(matcher, patch);
@@ -109,30 +107,41 @@ function backgroundVerdict(mean: RGB, darkTile: RGB): Verdict {
  * alignment that suits it best. Returns the winner's fit to the patch.
  */
 function settle(reader: Reader, square: Square, finalists: Fit[]): Fit {
-	const pixels = pixelsOf(reader.pic, reader.view, square);
-	let best: Fit | undefined;
-	let bestResidual = Infinity;
-	for (const fit of finalists) {
-		const levels = fit.template.sprite!.levels;
-		for (const dy of ALIGNMENT_OFFSETS) {
-			for (const dx of ALIGNMENT_OFFSETS) {
-				const residual = fitPixels(reader.pic, pixels, levels, dx, dy);
-				if (residual < bestResidual) {
-					bestResidual = residual;
-					best = fit;
-				}
-			}
+	const pixels = pixelsOf(reader.pic, reader.view.pieces, square);
+	const residuals = finalists.map((fit) => alignedResidual(reader.pic, pixels, fit.template.sprite!.levels)); // prettier-ignore
+	return finalists[residuals.indexOf(Math.min(...residuals))]!;
+}
+
+/**
+ * A piece's lowest pixel-level residual over the alignment offsets. The residual falls steadily
+ * toward the best alignment, so walking downhill from no offset finds it.
+ */
+function alignedResidual(pic: Picture, pixels: PixelSet, levels: MipLevel[]): number {
+	const n = ALIGNMENT_OFFSETS.length;
+	const residuals = new Map<number, number>();
+	const at = (i: number, j: number): number => {
+		if (i < 0 || j < 0 || i >= n || j >= n) return Infinity;
+		const key = i * n + j;
+		if (!residuals.has(key)) residuals.set(key, fitPixels(pic, pixels, levels, ALIGNMENT_OFFSETS[i]!, ALIGNMENT_OFFSETS[j]!)); // prettier-ignore
+		return residuals.get(key)!;
+	};
+	let [i, j] = [(n - 1) / 2, (n - 1) / 2];
+	for (;;) {
+		let [bestI, bestJ] = [i, j];
+		for (let di = -1; di <= 1; di++) {
+			for (let dj = -1; dj <= 1; dj++) if (at(i + di, j + dj) < at(bestI, bestJ)) [bestI, bestJ] = [i + di, j + dj]; // prettier-ignore
 		}
+		if (bestI === i && bestJ === j) return at(i, j);
+		[i, j] = [bestI, bestJ];
 	}
-	return best!;
 }
 
 /** The pixels a square is compared over: every few, within its margins. */
-function pixelsOf(pic: Picture, view: View, square: Square): PixelSet {
+function pixelsOf(pic: Picture, plane: Plane, square: Square): PixelSet {
 	const { column, row, size } = square;
 	const margin = 1 / MAX_PIXELS_PER_SIDE + 0.5 / size;
 	const step = Math.max(1, Math.floor(size / MAX_PIXELS_PER_SIDE));
-	const corners = [project(view.toImage, column, row), project(view.toImage, column + 1, row), project(view.toImage, column, row + 1), project(view.toImage, column + 1, row + 1)]; // prettier-ignore
+	const corners = [project(plane.toImage, column, row), project(plane.toImage, column + 1, row), project(plane.toImage, column, row + 1), project(plane.toImage, column + 1, row + 1)]; // prettier-ignore
 	const left = Math.max(0, Math.floor(Math.min(...corners.map((p) => p[0]))));
 	const right = Math.min(pic.width - 1, Math.ceil(Math.max(...corners.map((p) => p[0]))));
 	const top = Math.max(0, Math.floor(Math.min(...corners.map((p) => p[1]))));
@@ -142,7 +151,7 @@ function pixelsOf(pic: Picture, view: View, square: Square): PixelSet {
 	const vs: number[] = [];
 	for (let py = top; py <= bottom; py += step) {
 		for (let px = left; px <= right; px += step) {
-			const [boardU, boardV] = project(view.toBoard, px + 0.5, py + 0.5);
+			const [boardU, boardV] = project(plane.toBoard, px + 0.5, py + 0.5);
 			const [u, v] = [boardU - column, boardV - row];
 			if (u < margin || v < margin || u > 1 - margin || v > 1 - margin) continue;
 			indices.push(py * pic.width + px);

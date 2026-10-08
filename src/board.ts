@@ -4,7 +4,6 @@
  */
 
 import type { RGB } from './color.js';
-import type { Point } from './homography.js';
 import type { Picture } from './picture.js';
 import type { Promotion, WorldBorder } from './icn.js';
 import type { SampledSquare } from './matcher.js';
@@ -13,7 +12,6 @@ import type { Square, View } from './view.js';
 
 import { colorDistance } from './color.js';
 import { project } from './homography.js';
-import { innerMask, meanColor } from './matcher.js';
 import { colorAt } from './picture.js';
 import { isTileColor, projectOntoTiles } from './tiles.js';
 
@@ -75,8 +73,7 @@ export function rankOf(frame: Frame, row: number): number {
 /** Which parity of column + row the dark tiles sit on, by majority vote of the squares. */
 export function findDarkParity(sampled: SampledSquare[], [dark, light]: Tiles): 0 | 1 {
 	let votes = 0;
-	for (const { square, sizeClass, patch } of sampled) {
-		const mean = meanColor(patch, innerMask(sizeClass.samples));
+	for (const { square, mean } of sampled) {
 		const isDark = colorDistance(mean, dark) < colorDistance(mean, light);
 		votes += isDark === (parity(square.column + square.row) === 0) ? 1 : -1;
 	}
@@ -95,7 +92,7 @@ function parity(n: number): 0 | 1 {
  * @throws If no square does.
  */
 export function findBoardExtent(sampled: SampledSquare[], tiles: Tiles): Extent {
-	const onBoard = sampled.filter(({ patch }) => showsTile(patch, tiles));
+	const onBoard = sampled.filter(({ patch, mean }) => (patch ? showsTile(patch, tiles) : isTileColor(mean, tiles))); // prettier-ignore
 	if (onBoard.length === 0) throw new Error('No board squares found in the image.');
 	return extentOf(onBoard.map(({ square }) => square));
 }
@@ -196,34 +193,35 @@ function lineAlong(
 	let length = 0;
 	for (let i = 0; i < steps; i++) {
 		const u = column + (i + 0.5) / steps;
-		const on = project(view.toImage, u, k);
-		const next = project(view.toImage, u, k + 0.01);
-		const across = Math.hypot(next[0] - on[0], next[1] - on[1]);
-		const normal: Point = [(next[0] - on[0]) / across, (next[1] - on[1]) / across];
-		const at = (distance: number): Point => [on[0] + distance * normal[0], on[1] + distance * normal[1]]; // prettier-ignore
-		if (!isTileAt(pic, at(-reach), tiles) || !isTileAt(pic, at(reach), tiles)) continue;
-		if (isLineAt(pic, at(-0.5), tiles) || isLineAt(pic, at(0.5), tiles)) length += 1 / steps;
+		const [x, y] = project(view.toImage, u, k);
+		const [nextX, nextY] = project(view.toImage, u, k + 0.01);
+		const across = Math.sqrt((nextX - x) ** 2 + (nextY - y) ** 2);
+		const [nx, ny] = [(nextX - x) / across, (nextY - y) / across];
+		if (!isTileAt(pic, x - reach * nx, y - reach * ny, tiles)) continue;
+		if (!isTileAt(pic, x + reach * nx, y + reach * ny, tiles)) continue;
+		const onLine = isLineAt(pic, x - 0.5 * nx, y - 0.5 * ny, tiles) || isLineAt(pic, x + 0.5 * nx, y + 0.5 * ny, tiles); // prettier-ignore
+		if (onLine) length += 1 / steps;
 	}
 	return length;
 }
 
-/** The index of the pixel holding a point, if the image does. */
-function pixelAt(pic: Picture, [x, y]: Point): number | undefined {
+/** The index of the pixel holding a point, or -1 if the image doesn't. */
+function pixelAt(pic: Picture, x: number, y: number): number {
 	const [px, py] = [Math.floor(x), Math.floor(y)];
-	if (px < 0 || py < 0 || px >= pic.width || py >= pic.height) return undefined;
+	if (px < 0 || py < 0 || px >= pic.width || py >= pic.height) return -1;
 	return py * pic.width + px;
 }
 
 /** Whether the pixel at a point is a tile color. */
-function isTileAt(pic: Picture, point: Point, tiles: Tiles): boolean {
-	const i = pixelAt(pic, point);
-	return i !== undefined && isTileColor(colorAt(pic, i), tiles);
+function isTileAt(pic: Picture, x: number, y: number, tiles: Tiles): boolean {
+	const i = pixelAt(pic, x, y);
+	return i >= 0 && isTileColor(colorAt(pic, i), tiles);
 }
 
 /** Whether the pixel at a point lies off the blend of the tile colors, or darker than it, as on a line drawn over them. */
-function isLineAt(pic: Picture, point: Point, tiles: Tiles): boolean {
-	const i = pixelAt(pic, point);
-	if (i === undefined) return false;
+function isLineAt(pic: Picture, x: number, y: number, tiles: Tiles): boolean {
+	const i = pixelAt(pic, x, y);
+	if (i < 0) return false;
 	const [t, off] = projectOntoTiles(pic, i, tiles);
 	return off > LINE_TOLERANCE || t * colorDistance(tiles[0], tiles[1]) < -LINE_TOLERANCE;
 }

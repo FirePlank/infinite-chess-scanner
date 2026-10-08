@@ -25,6 +25,10 @@ export interface Grid {
 /** How far a square may poke out of the image and still count as fully visible, in pixels. */
 export const EDGE_TOLERANCE = 0.75;
 
+/** Bounds of the step the square size is first searched at, in pixels. */
+const MIN_SIZE_STEP = 0.002;
+const MAX_SIZE_STEP = 0.05;
+
 // Grid ------------------------------------------------------------------------
 
 /**
@@ -87,20 +91,25 @@ function coarseSquareSize(xEdges: Float64Array, yEdges: Float64Array, maxSize: n
 function refineSquareSize(xEdges: Float64Array, yEdges: Float64Array, coarse: number): number {
 	const xSparse = sparseEdges(xEdges);
 	const ySparse = sparseEdges(yEdges);
-	const strength = (size: number): number =>
-		Math.hypot(...combCoefficient(xSparse, size)) +
-		Math.hypot(...combCoefficient(ySparse, size));
+	const strength = (size: number): number => {
+		const [xr, xi] = combCoefficient(xSparse, size);
+		const [yr, yi] = combCoefficient(ySparse, size);
+		return Math.sqrt(xr * xr + xi * xi) + Math.sqrt(yr * yr + yi * yi);
+	};
+	// The peak narrows as the edges span more periods: a third of its half-width steps over it safely.
+	const span = Math.max(xEdges.length, yEdges.length);
+	const step = Math.min(MAX_SIZE_STEP, Math.max(MIN_SIZE_STEP, (coarse * coarse) / (6 * span)));
 	let best = coarse;
 	let bestStrength = strength(best);
-	for (let size = coarse - 1.5; size <= coarse + 1.5; size += 0.002) {
+	for (let size = coarse - 1.5; size <= coarse + 1.5; size += step) {
 		const candidate = strength(size);
 		if (candidate <= bestStrength) continue;
 		best = size;
 		bestStrength = candidate;
 	}
 	// Golden-section search down to a negligible fraction of a pixel across the whole image.
-	let lo = best - 0.002;
-	let hi = best + 0.002;
+	let lo = best - step;
+	let hi = best + step;
 	const ratio = (Math.sqrt(5) - 1) / 2;
 	while (hi - lo > 1e-7) {
 		const a = hi - ratio * (hi - lo);

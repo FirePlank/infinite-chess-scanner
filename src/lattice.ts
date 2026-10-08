@@ -43,8 +43,22 @@ const CELL_SIZE = 16;
 /** How far down the screen an axis must point to be one the pieces might stand along, as a cosine. */
 const MIN_DOWNWARDNESS = 0.05;
 
+/** How much the lattice grows before its homography is refitted to predict further corners. */
+const REFIT_GROWTH = 1.1;
+
+/** How many lattice corners settle the homography without trying further seeds. */
+const ENOUGH_LATTICE_CORNERS = 200;
+
 /** How few lattice corners leave the homography too uncertain to trust. */
 const MIN_LATTICE_CORNERS = 12;
+
+// State -----------------------------------------------------------------------
+
+/** The rings of {@link ringOffsets}, by image width. */
+const RINGS = new Map<number, Int32Array>();
+
+/** Scratch ring values for {@link isCornerNear}, reused across its calls. */
+const RING_VALUES = new Int8Array(RING_POINTS);
 
 // Corners ---------------------------------------------------------------------
 
@@ -53,9 +67,8 @@ const MIN_LATTICE_CORNERS = 12;
  * each point matching the one opposite it. Unlike reading along the image axes, this works at any
  * rotation and slant.
  */
-export function findCorners(pic: Picture, shades: Float32Array): Point[] {
+export function findCorners(pic: Picture, classes: Int8Array): Point[] {
 	const { width, height } = pic;
-	const classes = tileClasses(shades);
 	const ring = ringOffsets(width);
 	const hits = new Uint8Array(width * height);
 	const values = new Int8Array(RING_POINTS);
@@ -67,8 +80,21 @@ export function findCorners(pic: Picture, shades: Float32Array): Point[] {
 	return clusterCenters(hits, width);
 }
 
+/** Whether a checkerboard corner shows within a pixel of a point. */
+export function isCornerNear(pic: Picture, classes: Int8Array, x: number, y: number): boolean {
+	const ring = ringOffsets(pic.width);
+	const values = RING_VALUES;
+	for (let py = Math.floor(y - 1.5); py <= Math.floor(y + 0.5); py++) {
+		for (let px = Math.floor(x - 1.5); px <= Math.floor(x + 0.5); px++) {
+			const inside = px >= RING_RADIUS && py >= RING_RADIUS && px < pic.width - RING_RADIUS && py < pic.height - RING_RADIUS; // prettier-ignore
+			if (inside && isCornerAt(classes, py * pic.width + px, ring, values)) return true;
+		}
+	}
+	return false;
+}
+
 /** Each pixel's tile: 0 for the dark, 1 for the light, -1 when it's neither. */
-function tileClasses(shades: Float32Array): Int8Array {
+export function tileClasses(shades: Float32Array): Int8Array {
 	const classes = new Int8Array(shades.length);
 	for (let i = 0; i < shades.length; i++) {
 		const shade = shades[i]!;
@@ -77,9 +103,12 @@ function tileClasses(shades: Float32Array): Int8Array {
 	return classes;
 }
 
-/** The offsets of the ring's pixels around a pixel, as index steps in an image of a width. */
+/** The offsets of the ring's pixels around a pixel, as index steps in an image of a width. Kept per width. */
 function ringOffsets(width: number): Int32Array {
+	const kept = RINGS.get(width);
+	if (kept) return kept;
 	const ring = new Int32Array(RING_POINTS);
+	RINGS.set(width, ring);
 	for (let k = 0; k < RING_POINTS; k++) {
 		const angle = (2 * Math.PI * k) / RING_POINTS;
 		ring[k] = Math.round(RING_RADIUS * Math.sin(angle)) * width + Math.round(RING_RADIUS * Math.cos(angle)); // prettier-ignore
@@ -172,7 +201,6 @@ function growLattice(
 	width: number,
 	height: number,
 ): Map<LatticeKey, Point> | undefined {
-	// prettier-ignore
 	const index = new CornerIndex(corners);
 	const middle: Point = [width / 2, height / 2];
 	// Seeds spread outward from the middle, as stray corners cluster where pieces stand.
@@ -183,7 +211,7 @@ function growLattice(
 	for (const seed of seeds) {
 		const lattice = growFrom(seed, index, width, height);
 		if (lattice && lattice.size > (best?.size ?? 0)) best = lattice;
-		if (best && best.size > corners.length / 2) break;
+		if (best && (best.size >= ENOUGH_LATTICE_CORNERS || best.size > corners.length / 2)) break;
 	}
 	return best && best.size >= MIN_LATTICE_CORNERS ? best : undefined;
 }
@@ -195,11 +223,11 @@ function growFrom(
 	width: number,
 	height: number,
 ): Map<LatticeKey, Point> | undefined {
-	// prettier-ignore
 	const lattice = seedLattice(seed, index);
 	if (lattice === undefined) return undefined;
 	const used = new Set(lattice.values());
 	let h = fitHomography(pairsOf(lattice));
+	let fitted = lattice.size;
 	// Rings that add nothing are tolerated a few times, as a row of pieces can hide a ring's corners.
 	for (let radius = 2, emptyRings = 0; emptyRings < 3; radius++) {
 		let added = 0;
@@ -214,7 +242,11 @@ function growFrom(
 			}
 		}
 		emptyRings = added === 0 ? emptyRings + 1 : 0;
-		if (added > 0) h = fitHomography(pairsOf(lattice));
+		// Refitting once the lattice has grown a little predicts the next ring just as well.
+		if (lattice.size >= REFIT_GROWTH * fitted) {
+			h = fitHomography(pairsOf(lattice));
+			fitted = lattice.size;
+		}
 	}
 	return lattice;
 }
@@ -313,7 +345,7 @@ function pairsOf(lattice: Map<LatticeKey, Point>): [Point, Point][] {
 
 /** Corners bucketed into square cells, for finding those near a point without visiting all. */
 class CornerIndex {
-	private readonly cells = new Map<string, Point[]>();
+	private readonly cells = new Map<number, Point[]>();
 
 	constructor(corners: Point[]) {
 		for (const corner of corners) {
@@ -331,7 +363,7 @@ class CornerIndex {
 		const [cx, cy] = [Math.floor(point[0] / CELL_SIZE), Math.floor(point[1] / CELL_SIZE)];
 		for (let dy = -reach; dy <= reach; dy++) {
 			for (let dx = -reach; dx <= reach; dx++) {
-				for (const corner of this.cells.get(`${cx + dx},${cy + dy}`) ?? []) {
+				for (const corner of this.cells.get(cellKey(cx + dx, cy + dy)) ?? []) {
 					if (distance(corner, point) <= within) found.push(corner);
 				}
 			}
@@ -350,14 +382,19 @@ class CornerIndex {
 	}
 
 	/** The key of the cell holding a point. */
-	private cellOf(x: number, y: number): string {
-		return `${Math.floor(x / CELL_SIZE)},${Math.floor(y / CELL_SIZE)}`;
+	private cellOf(x: number, y: number): number {
+		return cellKey(Math.floor(x / CELL_SIZE), Math.floor(y / CELL_SIZE));
 	}
+}
+
+/** The key of the cell at a column and row of cells. */
+function cellKey(column: number, row: number): number {
+	return row * 65536 + column;
 }
 
 /** The distance between two points. */
 function distance(a: Point, b: Point): number {
-	return Math.hypot(a[0] - b[0], a[1] - b[1]);
+	return Math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2);
 }
 
 /** The angle between the lines from a center through two points, ignoring direction, in [0, π/2]. */

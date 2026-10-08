@@ -53,12 +53,9 @@ export function findTileColors(pic: Picture): Tiles {
 		if (distinct && (best === undefined || count > votes.get(best)!)) best = pair;
 	}
 	if (best === undefined) throw new Error('No checkerboard with readable squares found in the image.'); // prettier-ignore
-	const tiles = [
-		meanOfBin(pic, bins, Math.floor(best / BIN_COUNT)),
-		meanOfBin(pic, bins, best % BIN_COUNT),
-	];
+	const tiles = meansOfBins(pic, bins, Math.floor(best / BIN_COUNT), best % BIN_COUNT);
 	tiles.sort((a, b) => luminance(a) - luminance(b));
-	return [tiles[0]!, tiles[1]!];
+	return [tiles[0], tiles[1]];
 }
 
 /** Tallies the color bin pairs meeting at checkerboard corners, read a reach away from each. */
@@ -84,9 +81,9 @@ function countCorners(
 
 /** The 6-bit-per-channel color histogram bin of pixel i. */
 function binOf(rgb: Float32Array, i: number): number {
-	const r = Math.round(rgb[i * 3]! * 255) >> 2;
-	const g = Math.round(rgb[i * 3 + 1]! * 255) >> 2;
-	const b = Math.round(rgb[i * 3 + 2]! * 255) >> 2;
+	const r = ((rgb[i * 3]! * 255 + 0.5) | 0) >> 2;
+	const g = ((rgb[i * 3 + 1]! * 255 + 0.5) | 0) >> 2;
+	const b = ((rgb[i * 3 + 2]! * 255 + 0.5) | 0) >> 2;
 	return (r << 12) | (g << 6) | b;
 }
 
@@ -95,16 +92,21 @@ function binColor(bin: number): RGB {
 	return [((bin >> 12) + 0.5) / 64, (((bin >> 6) & 63) + 0.5) / 64, ((bin & 63) + 0.5) / 64];
 }
 
-/** The exact mean color of the pixels in a histogram bin. */
-function meanOfBin(pic: Picture, bins: Uint32Array, bin: number): RGB {
-	const sum: RGB = [0, 0, 0];
-	let n = 0;
+/** The exact mean colors of the pixels in two histogram bins. */
+function meansOfBins(pic: Picture, bins: Uint32Array, first: number, second: number): [RGB, RGB] {
+	const sums = [new Float64Array(4), new Float64Array(4)] as const;
 	for (let i = 0; i < bins.length; i++) {
-		if (bins[i] !== bin) continue;
+		const sum = bins[i] === first ? sums[0] : bins[i] === second ? sums[1] : undefined;
+		if (sum === undefined) continue;
 		for (let c = 0; c < 3; c++) sum[c]! += pic.rgb[i * 3 + c]!;
-		n++;
+		sum[3]!++;
 	}
-	return [sum[0] / n, sum[1] / n, sum[2] / n];
+	const mean = (sum: Float64Array): RGB => [
+		sum[0]! / sum[3]!,
+		sum[1]! / sum[3]!,
+		sum[2]! / sum[3]!,
+	];
+	return [mean(sums[0]), mean(sums[1])];
 }
 
 /** Whether a color is one of the tile colors. */
@@ -125,7 +127,10 @@ export function tileShades(pic: Picture, [dark, light]: Tiles): Float32Array {
 		const g = pic.rgb[i * 3 + 1]! - dark[1];
 		const b = pic.rgb[i * 3 + 2]! - dark[2];
 		const t = (r * ar + g * ag + b * ab) / lengthSq;
-		const off = Math.hypot(r - t * ar, g - t * ag, b - t * ab);
+		const offR = r - t * ar;
+		const offG = g - t * ag;
+		const offB = b - t * ab;
+		const off = Math.sqrt(offR * offR + offG * offG + offB * offB);
 		shades[i] = off < tolerance && t > -0.25 && t < 1.25 ? t : NaN;
 	}
 	return shades;

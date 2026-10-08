@@ -1,7 +1,6 @@
 /**
- * Homographies: the projective maps between the board's plane and the screen. The board, pieces
- * included, is one flat plane, so a single homography places all of it, whether the screenshot
- * looks straight down or at an angle.
+ * Homographies: the projective maps between planes on the board and the screen, whether the
+ * screenshot looks straight down or at an angle.
  */
 
 // Types -----------------------------------------------------------------------
@@ -11,6 +10,11 @@ export type Homography = number[];
 
 /** A 2D point. */
 export type Point = [number, number];
+
+// Constants -------------------------------------------------------------------
+
+/** How far a camera's two calibration equations may disagree, relative, before it's off center. */
+const CALIBRATION_TOLERANCE = 0.05;
 
 // Functions -------------------------------------------------------------------
 
@@ -57,6 +61,36 @@ export function stretch(h: Homography, x: number, y: number): number {
 	const dx = Math.hypot(h[0]! - px * h[6]!, h[3]! - py * h[6]!) / w;
 	const dy = Math.hypot(h[1]! - px * h[7]!, h[4]! - py * h[7]!) / w;
 	return Math.max(dx, dy);
+}
+
+/**
+ * The homography of a plane parallel to the one h maps, raised toward the camera by a fraction of
+ * the camera's height above it. The camera is taken to look through the image's center with square
+ * pixels, its focal length calibrated from h. Returns h when it can't calibrate, as when seen
+ * straight down or cropped off center.
+ */
+export function raise(h: Homography, width: number, height: number, fraction: number): Homography {
+	const [cx, cy] = [width / 2, height / 2];
+	const [h0, h1, h2, h3, h4, h5, h6, h7, h8] = h as [number, number, number, number, number, number, number, number, number]; // prettier-ignore
+	// The board's axes, through the camera's intrinsics but the focal length, are perpendicular
+	// and equally long: two equations in 1/f².
+	const [x1, y1, x2, y2] = [h0 - cx * h6, h3 - cy * h6, h1 - cx * h7, h4 - cy * h7];
+	const [p1, q1] = [x1 * x2 + y1 * y2, h6 * h7];
+	const [p2, q2] = [x1 * x1 + y1 * y1 - x2 * x2 - y2 * y2, h6 * h6 - h7 * h7];
+	const inverseSquare = -(p1 * q1 + p2 * q2) / (p1 * p1 + p2 * p2);
+	const mismatch =
+		Math.hypot(p1 * inverseSquare + q1, p2 * inverseSquare + q2) / Math.hypot(q1, q2);
+	if (!(inverseSquare > 0) || !(mismatch < CALIBRATION_TOLERANCE)) return h;
+	const f = 1 / Math.sqrt(inverseSquare);
+	// The plane's normal, and the camera's height along it, in the camera's frame.
+	const [ax, ay, az] = [x1 / f, y1 / f, h6];
+	const [bx, by, bz] = [x2 / f, y2 / f, h7];
+	let [nx, ny, nz] = [ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx];
+	const length = Math.hypot(nx, ny, nz);
+	[nx, ny, nz] = [nx / length, ny / length, nz / length];
+	const rise = -fraction * (nx * ((h2 - cx * h8) / f) + ny * ((h5 - cy * h8) / f) + nz * h8);
+	const raised = [h0, h1, h2 + rise * (f * nx + cx * nz), h3, h4, h5 + rise * (f * ny + cy * nz), h6, h7, h8 + rise * nz]; // prettier-ignore
+	return raised.map((v) => v / raised[8]!);
 }
 
 /** The least-squares homography mapping each pair's first point to its second, by normalized DLT. */

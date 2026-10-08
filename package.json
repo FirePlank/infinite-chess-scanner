@@ -18,8 +18,8 @@
     "node": ">=18.17"
   },
   "scripts": {
-    "build": "tsc",
-    "prepare": "tsc",
+    "build": "tsc && node dist/cache-sprites.js",
+    "prepare": "npm run build",
     "test": "tsx --test test/*.test.ts",
     "format": "prettier . --write",
     "check": "tsc --noEmit && prettier . --check"
