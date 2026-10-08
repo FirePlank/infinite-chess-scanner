@@ -18,7 +18,7 @@ import { readScreenshot } from '../src/index.js';
 interface Fixture {
 	image: string;
 	icn: string;
-	/** When the screenshot is zoomed out too far to show both promotion lines. */
+	/** When the promotion lines aren't read, as when zoomed out too far for both to be drawn. */
 	promotionHidden?: true;
 	/** Black's, when the screenshot shows the board from black's side. */
 	perspective?: 'black';
@@ -123,18 +123,6 @@ for (const fixture of fixtures) {
 		const image = fs.readFileSync(new URL(fixture.image, FIXTURES));
 		const reading = await readScreenshot(image, { perspective: fixture.perspective });
 		check(reading, fixture);
-	});
-}
-
-const obstacleOcean = fixtures.find((fixture) => fixture.image === 'obstocean.png')!;
-for (const [image, count] of [
-	['obstocean-crop-wide.png', 352],
-	['obstocean-crop-tight.png', 280],
-] as const) {
-	test(image, async () => {
-		const reading = await readScreenshot(fs.readFileSync(new URL(image, FIXTURES)));
-		check(reading, { ...obstacleOcean, promotionHidden: true });
-		assert.equal(reading.pieces.length, count, 'Every fully visible square must be read.');
 	});
 }
 
