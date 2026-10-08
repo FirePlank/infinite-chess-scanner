@@ -18,7 +18,7 @@ import { readScreenshot } from '../src/index.js';
 interface Fixture {
 	image: string;
 	icn: string;
-	/** When the screenshot is zoomed out too far to show both promotion lines. */
+	/** When the promotion lines aren't read, as when zoomed out too far for both to be drawn. */
 	promotionHidden?: true;
 	/** Black's, when the screenshot shows the board from black's side. */
 	perspective?: 'black';
