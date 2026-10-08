@@ -1,0 +1,36 @@
+{
+  "name": "infinite-chess-scanner",
+  "version": "1.0.0",
+  "description": "Reads the position off a screenshot of an infinitechess.org board into ICN.",
+  "license": "AGPL-3.0-only",
+  "author": "FirePlank",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "infinite-chess-scanner": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "assets"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc",
+    "test": "tsx --test test/*.test.ts",
+    "format": "prettier . --write",
+    "check": "tsc --noEmit && prettier . --check"
+  },
+  "dependencies": {
+    "sharp": "^0.33.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.1",
+    "prettier": "^3.7.3",
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.2"
+  }
+}
