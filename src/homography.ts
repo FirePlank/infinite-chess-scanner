@@ -65,12 +65,18 @@ export function stretch(h: Homography, x: number, y: number): number {
 
 /**
  * The homography of a plane parallel to the one h maps, raised toward the camera by a fraction of
- * the camera's height above it. The camera is taken to look through the image's center with square
- * pixels, its focal length calibrated from h. Returns h when it can't calibrate, as when seen
- * straight down or cropped off center.
+ * the camera's height above it. The camera is taken to look through the image's center, or a given
+ * one, with square pixels, its focal length calibrated from h. Returns h when it can't calibrate, as
+ * when seen straight down or cropped off center.
  */
-export function raise(h: Homography, width: number, height: number, fraction: number): Homography {
-	const [cx, cy] = [width / 2, height / 2];
+export function raise(
+	h: Homography,
+	width: number,
+	height: number,
+	fraction: number,
+	center: Point = [width / 2, height / 2],
+): Homography {
+	const [cx, cy] = center;
 	const [h0, h1, h2, h3, h4, h5, h6, h7, h8] = h as [number, number, number, number, number, number, number, number, number]; // prettier-ignore
 	// The board's axes, through the camera's intrinsics but the focal length, are perpendicular
 	// and equally long: two equations in 1/f².

@@ -10,19 +10,20 @@ import type { Picture } from './picture.js';
 import type { Piece } from './pieces.js';
 import type { MipLevel } from './sprites.js';
 import type { Plane, Square, View } from './view.js';
+import type { Tiles } from './tiles.js';
 
-import { colorDistance, luminance } from './color.js';
 import { project } from './homography.js';
 import {
 	fitTemplate,
 	glowAt,
 	innerMask,
 	isPlain,
-	meanColor,
 	patchSums,
 	rankFits,
+	refinePhotoFits,
 } from './matcher.js';
 import { royalCounterpart } from './pieces.js';
+import { isVoidColor } from './tiles.js';
 import { sampleTexture, textureLod } from './sprites.js';
 
 // Types -----------------------------------------------------------------------
@@ -31,7 +32,9 @@ import { sampleTexture, textureLod } from './sprites.js';
 export interface Reader {
 	pic: Picture;
 	view: View;
-	darkTile: RGB;
+	tiles: Tiles;
+	/** Whether a square neither a piece nor the background explains reads as covered. */
+	detectsCovers: boolean;
 }
 
 /** The screen pixels a square is compared over at pixel level, and where each falls in it. */
@@ -45,7 +48,8 @@ interface PixelSet {
 }
 
 /** What one square holds. */
-export type Verdict = { kind: 'empty' } | { kind: 'void' } | { kind: 'piece'; piece: Piece };
+export type Verdict =
+	{ kind: 'empty' } | { kind: 'void' } | { kind: 'obscured' } | { kind: 'piece'; piece: Piece };
 
 // Constants -------------------------------------------------------------------
 
@@ -75,19 +79,42 @@ export function classify(
 	{ square, sizeClass, mean, patch }: SampledSquare,
 	matchers: (sizeClass: SizeClass) => Matcher,
 ): Verdict {
-	const { darkTile } = reader;
-	if (patch === undefined || isPlain(patch, innerMask(sizeClass.samples))) return backgroundVerdict(mean, darkTile); // prettier-ignore
+	const { tiles } = reader;
+	if (patch === undefined || isPlain(patch, innerMask(sizeClass.samples))) return backgroundVerdict(mean, tiles); // prettier-ignore
 	const matcher = matchers(sizeClass);
 
 	const sums = patchSums(matcher, patch);
-	const ranked = rankFits(matcher, patch, sums);
+	let ranked = rankFits(matcher, patch, sums);
+	if (matcher.photographed) {
+		ranked = refinePhotoFits(matcher, patch, sums, ranked);
+	}
 	const background = fitTemplate(matcher.empty, matcher, patch, sums);
+	const samples = matcher.mask.reduce((sum, kept) => sum + kept, 0);
+	const unexplained = matcher.photographed
+		? 0.06 + 2 * Math.min(0.03, ranked[0]!.noise ?? 0)
+		: 0.04;
+	const unexplainedRatio = matcher.photographed ? 0.45 : PIECE_FIT_RATIO;
+	if (
+		reader.detectsCovers &&
+		Math.min(ranked[0]!.residual, background.residual) > unexplained * samples &&
+		ranked[0]!.residual > unexplainedRatio * background.residual
+	) {
+		return { kind: 'obscured' };
+	}
 	if (ranked[0]!.residual > PIECE_FIT_RATIO * background.residual)
-		return backgroundVerdict(mean, darkTile);
+		return backgroundVerdict(mean, tiles);
 	const finalists = ranked
+		.filter(
+			(fit) =>
+				!matcher.photographed ||
+				fit.template.sprite!.piece.player === ranked[0]!.template.sprite!.piece.player,
+		) // prettier-ignore
 		.slice(0, FINALIST_COUNT)
 		.filter((fit) => fit.residual <= FINALIST_MARGIN * ranked[0]!.residual);
-	const best = finalists.length > 1 ? settle(reader, square, finalists) : ranked[0]!;
+	const best =
+		!matcher.photographed && finalists.length > 1
+			? settle(reader, square, finalists)
+			: ranked[0]!;
 
 	const piece = best.template.sprite!.piece;
 	const royal = royalCounterpart(piece);
@@ -96,10 +123,8 @@ export function classify(
 }
 
 /** A pieceless square is a void when it's clearly darker than even the dark tiles. */
-function backgroundVerdict(mean: RGB, darkTile: RGB): Verdict {
-	const isVoid =
-		colorDistance(mean, darkTile) > 0.08 && luminance(mean) < 0.8 * luminance(darkTile);
-	return isVoid ? { kind: 'void' } : { kind: 'empty' };
+function backgroundVerdict(mean: RGB, tiles: Tiles): Verdict {
+	return isVoidColor(mean, tiles) ? { kind: 'void' } : { kind: 'empty' };
 }
 
 /**

@@ -9,6 +9,7 @@ import type { Reading } from '../src/index.js';
 import fs from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import sharp from 'sharp';
 
 import { readScreenshot } from '../src/index.js';
 
@@ -22,6 +23,14 @@ interface Fixture {
 	promotionHidden?: true;
 	/** Black's, when the screenshot shows the board from black's side. */
 	perspective?: 'black';
+	/** Visible pieces and voids, guarding against an overly narrow board region. */
+	minimumPieces?: number;
+	/** Position squares covered by UI or foreground objects, which must not count as shown. */
+	hiddenSquares?: string[];
+	/** Exposed squares beside an occlusion, guarding against cropping away whole rows or columns. */
+	visibleSquares?: string[];
+	/** Independently known visible world-border sides: left, right, bottom, top. */
+	worldBorderVisible?: [boolean, boolean, boolean, boolean];
 }
 
 /** The parts of an ICN the scanner reads. */
@@ -74,9 +83,28 @@ function findTranslation(expected: Position, read: Position): [number, number] {
 function check(reading: Reading, fixture: Fixture): void {
 	const expected = parse(fixture.icn);
 	const read = parse(reading.icn);
+	if (fixture.minimumPieces !== undefined)
+		assert.ok(
+			read.pieces.size >= fixture.minimumPieces,
+			`Only ${read.pieces.size} of at least ${fixture.minimumPieces} visible pieces were read.`,
+		);
 	const [dx, dy] = findTranslation(expected, read);
 	const { area } = reading;
 	assert.equal(Math.abs(dx + dy) % 2, 0, 'Light and dark squares are swapped.');
+	for (const key of fixture.hiddenSquares ?? []) {
+		const [x, y] = key.split(',').map(Number) as [number, number];
+		assert.ok(
+			!reading.shown.has(`${x + dx},${y + dy}`),
+			`Covered square ${key} counted as shown.`,
+		);
+	}
+	for (const key of fixture.visibleSquares ?? []) {
+		const [x, y] = key.split(',').map(Number) as [number, number];
+		assert.ok(
+			reading.shown.has(`${x + dx},${y + dy}`),
+			`Exposed square ${key} was excluded from the board region.`,
+		);
+	}
 
 	for (const [key, piece] of expected.pieces) {
 		const [x, y] = key.split(',').map(Number) as [number, number];
@@ -86,7 +114,12 @@ function check(reading: Reading, fixture: Fixture): void {
 	}
 	for (const [key, piece] of read.pieces) {
 		const [x, y] = key.split(',').map(Number) as [number, number];
-		assert.ok(expected.pieces.has(`${x - dx},${y - dy}`), `Extra ${piece} read at ${key}`);
+		assert.ok(reading.shown.has(key), `Piece at ${key} lies outside the visible board region.`);
+		assert.equal(
+			expected.pieces.get(`${x - dx},${y - dy}`),
+			piece,
+			`Extra or wrong ${piece} at ${key}`,
+		);
 	}
 
 	const shifted = fixture.promotionHidden
@@ -102,13 +135,17 @@ function check(reading: Reading, fixture: Fixture): void {
 	const side = (
 		value: number | null | undefined,
 		shift: number,
+		index: number,
 		shows: (v: number) => boolean,
-	) => (value != null && shows(value + shift) ? value + shift : null);
+	) =>
+		value != null && (fixture.worldBorderVisible?.[index] ?? shows(value + shift))
+			? value + shift
+			: null;
 	const border = [
-		side(left, dx, (v) => v > area.left),
-		side(right, dx, (v) => v < area.right),
-		side(bottom, dy, (v) => v > area.bottom),
-		side(top, dy, (v) => v < area.top),
+		side(left, dx, 0, (v) => v > area.left),
+		side(right, dx, 1, (v) => v < area.right),
+		side(bottom, dy, 2, (v) => v > area.bottom),
+		side(top, dy, 3, (v) => v < area.top),
 	];
 	const readBorder = read.border ?? [null, null, null, null];
 	assert.deepEqual(readBorder, border, 'World border');
@@ -123,6 +160,115 @@ for (const fixture of fixtures) {
 		const image = fs.readFileSync(new URL(fixture.image, FIXTURES));
 		const reading = await readScreenshot(image, { perspective: fixture.perspective });
 		check(reading, fixture);
+	});
+}
+
+for (const scenario of [
+	{
+		name: 'reads an embedded board with an opaque menu over empty squares',
+		left: 749,
+		top: 378,
+		width: 102,
+		height: 102,
+		background: '#f1f1f1',
+		minimumPieces: 32,
+		hiddenSquares: ['4,4', '5,4', '4,5', '5,5'],
+	},
+	{
+		name: 'excludes an opaque menu sharing the light tile color',
+		left: 749,
+		top: 378,
+		width: 102,
+		height: 102,
+		background: '#ffd9a8',
+		minimumPieces: 32,
+		hiddenSquares: ['4,4', '5,4', '4,5', '5,5'],
+	},
+	{
+		name: 'reads disconnected board regions around an opaque panel',
+		left: 750,
+		top: 0,
+		width: 150,
+		height: undefined,
+		background: '#f1f1f1',
+		minimumPieces: 20,
+		hiddenSquares: [
+			'4,1',
+			'5,1',
+			'6,1',
+			'4,2',
+			'5,2',
+			'6,2',
+			'4,7',
+			'5,7',
+			'6,7',
+			'4,8',
+			'5,8',
+			'6,8',
+		],
+	},
+	{
+		name: 'excludes a square whose piece is partially covered by opaque UI',
+		left: 825,
+		top: 290,
+		width: 25,
+		height: 28,
+		background: '#f1f1f1',
+		minimumPieces: 31,
+		hiddenSquares: ['5,7'],
+	},
+	{
+		name: 'reads an L-shaped board region behind a panel touching the image boundary',
+		left: -80,
+		top: -100,
+		width: 778,
+		height: 430,
+		background: '#f1f1f1',
+		minimumPieces: 28,
+		hiddenSquares: ['1,8', '2,8', '1,7', '2,7'],
+	},
+]) {
+	test(scenario.name, async () => {
+		const fixture = fixtures.find(({ image }) => image === 'classical.png')!;
+		const board = fs.readFileSync(new URL(fixture.image, FIXTURES));
+		const { width, height } = await sharp(board).metadata();
+		const padding = { left: 80, top: 100 };
+		// This fixture's squares are 50.5px across. Opaque UI covers the position
+		// coordinates listed by each scenario; the remaining pieces are fully visible.
+		const overlay = await sharp({
+			create: {
+				width: scenario.width,
+				height: scenario.height ?? height!,
+				channels: 3,
+				background: scenario.background,
+			},
+		})
+			.png()
+			.toBuffer();
+		const image = await sharp({
+			create: {
+				width: width! + 160,
+				height: height! + 200,
+				channels: 3,
+				background: '#313a42',
+			},
+		})
+			.composite([
+				{ input: board, ...padding },
+				{
+					input: overlay,
+					left: scenario.left + padding.left,
+					top: scenario.top + padding.top,
+				},
+			])
+			.png()
+			.toBuffer();
+		const reading = await readScreenshot(image);
+		check(reading, {
+			...fixture,
+			minimumPieces: scenario.minimumPieces,
+			hiddenSquares: scenario.hiddenSquares,
+		});
 	});
 }
 
