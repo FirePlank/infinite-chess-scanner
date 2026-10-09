@@ -3,9 +3,9 @@
  *
  * The grid is found from the edges between the two tile colors, so any board theme, zoom and
  * crop works. Each fully visible square is matched against the site's own piece sprites, rendered
- * the way its WebGL renders them. Coordinates are relative, as a screenshot can't tell where on the
- * infinite board it is: the middle visible square becomes 0,0, nudged so that x+y is even on dark
- * squares as on the site.
+ * the way its WebGL renders them. Coordinates are relative, with all pieces at x>=1 and Black's
+ * promotion rank at y=1 when exactly two promotion lines are visible. Otherwise, ranks stay centered
+ * on the visible board. Dark squares have an even x+y as on the site.
  */
 
 import type { PlacedPiece, Promotion, WorldBorder } from './icn.js';
@@ -33,6 +33,7 @@ import {
 	sampleSquares,
 } from './matcher.js';
 import {
+	anchorFrame,
 	fileOf,
 	findBoardExtent,
 	findPromotionLines,
@@ -115,10 +116,9 @@ export async function readScreenshot(
 		tiles.photographed,
 	);
 	const reader: Reader = { pic, view, darkTile: tiles[0] };
-	const frame = frameOf(region.squares, region.darkParity, options.perspective === 'black'); // prettier-ignore
+	const relativeFrame = frameOf(region.squares, region.darkParity, options.perspective === 'black'); // prettier-ignore
 
 	const pieces: PlacedPiece[] = [];
-	const shown = new Set<string>();
 	const accepted: Square[] = [];
 	for (const sampled of onBoard) {
 		const { square } = sampled;
@@ -133,7 +133,6 @@ export async function readScreenshot(
 				continue;
 		}
 		accepted.push(square);
-		shown.add(`${fileOf(frame, square.column)},${rankOf(frame, square.row)}`);
 		if (verdict.kind === 'empty') continue;
 		if (
 			tiles.photographed &&
@@ -144,12 +143,21 @@ export async function readScreenshot(
 		const abbreviation = verdict.kind === 'void' ? VOID_CODE : abbreviate(verdict.piece);
 		pieces.push({
 			abbreviation,
-			x: fileOf(frame, square.column),
-			y: rankOf(frame, square.row),
+			x: fileOf(relativeFrame, square.column),
+			y: rankOf(relativeFrame, square.row),
 		});
 	}
 
-	const promotion = readPromotion(findPromotionLines(pic, view, accepted, tiles), frame);
+	const lines = findPromotionLines(pic, view, accepted, tiles);
+	const frame = anchorFrame(relativeFrame, pieces, readPromotion(lines, relativeFrame));
+	const dx = fileOf(frame, 0) - fileOf(relativeFrame, 0);
+	const dy = rankOf(frame, 0) - rankOf(relativeFrame, 0);
+	for (const piece of pieces) {
+		piece.x += dx;
+		piece.y += dy;
+	}
+	const shown = new Set(accepted.map((square) => `${fileOf(frame, square.column)},${rankOf(frame, square.row)}`)); // prettier-ignore
+	const promotion = readPromotion(lines, frame);
 	const worldBorder = readWorldBorder(extent, [...region.squares, ...region.beyond], frame);
 	const coordinates = [...region.squares, ...region.beyond].map((square): [number, number] => [fileOf(frame, square.column), rankOf(frame, square.row)]); // prettier-ignore
 	const area = {
