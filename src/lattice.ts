@@ -253,6 +253,15 @@ function growLattice(
 	const attempts = photographed ? 40 : SEED_ATTEMPTS;
 	const stride = Math.max(1, Math.floor(corners.length / (4 * attempts)));
 	const seeds = byDistance.filter((_, i) => i % stride === 0).slice(0, attempts);
+	// An object or menu can leave the reliable grid far from the image center. Keep the quick
+	// central attempts, then cover the whole image before giving up on a photographed board.
+	if (photographed) {
+		const outerStride = Math.max(1, Math.floor(corners.length / attempts));
+		for (let i = 0; i < byDistance.length; i += outerStride) {
+			const seed = byDistance[i]!;
+			if (!seeds.includes(seed)) seeds.push(seed);
+		}
+	}
 	let best: Map<LatticeKey, Point> | undefined;
 	for (const seed of seeds) {
 		const initial = photographed ? photoSeeds(seed, index) : [seedLattice(seed, index)];

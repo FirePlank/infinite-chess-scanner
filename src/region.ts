@@ -21,6 +21,8 @@ interface Surface {
 	sides: [number, number];
 	corners: RGB[];
 	cornerEvidence: [number, number];
+	/** Interior luminance range, with photographic display noise outliers removed. */
+	variation: number;
 	/** A uniformly dark square can be a void, or sky beyond the world border. */
 	void: boolean;
 }
@@ -54,6 +56,9 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 		surfaces.map((surface) => [key(surface.square), surface.tiles]),
 	);
 	if (tiles.photographed) {
+		// Camera exposure can weaken a gray theme's contrast. Compare the local pair with the
+		// recovered theme while keeping enough separation to reject a uniform foreground.
+		const minimumContrast = Math.max(0.05, Math.min(0.08, 0.5 * (luminance(tiles[1]) - luminance(tiles[0])))); // prettier-ignore
 		for (const surface of surfaces) {
 			const nearby: [RGB[], RGB[]] = [[], []];
 			for (let dr = -3; dr <= 3; dr++) {
@@ -82,7 +87,7 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 			if (nearby.some((group) => group.length < 3)) continue;
 			const local: Tiles = [medianColor(nearby[0]), medianColor(nearby[1])];
 			if (
-				luminance(local[1]) - luminance(local[0]) < 0.08 ||
+				luminance(local[1]) - luminance(local[0]) < minimumContrast ||
 				luminance(local[0]) < luminance(tiles[0]) - 0.18
 			) {
 				surface.tiles = [0, 0];
@@ -110,6 +115,16 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 				const nearUi = neighbors(s.square).some(
 					(k) => index.has(k) && !tileSupported.has(k) && !index.get(k)!.void,
 				);
+				// Wires and other foreground fragments can resemble glyphs while leaving the
+				// grid corners visible. A busy cell beside an occlusion must show the tile on
+				// every side as well as at its corners.
+				if (
+					tiles.photographed &&
+					nearUi &&
+					s.variation >= 0.14 &&
+					(s.sides[side] < 0.4 || s.cornerEvidence[side] < 3)
+				)
+					return false;
 				return (
 					tileSupported.has(key(s.square)) &&
 					(view.perspective ||
@@ -141,16 +156,21 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 					square.column === right ||
 					square.row === top ||
 					square.row === bottom;
+				// A curved foreground or an application bar can make a genuine visible boundary
+				// lie inside the bounding box. Four observed crossings and a uniform interior
+				// support a bare tile with only two visible neighbors. Inferred crossings do not.
+				const complete = tiles.photographed && view.measuredCornerSupport && squareCorners(square).every((k) => view.measuredCornerSupport!.has(k)); // prettier-ignore
+				const surface = index.get(key(square))!;
+				const side = parity(square) === darkParity ? 0 : 1;
 				if (
 					!edge &&
+					!(complete && surface.variation < 0.14) &&
 					neighbors(square).filter((k) => supported.has(k) || index.get(k)?.void).length <
 						3
 				)
 					return false;
 				if (!view.cornerSupport || (!tiles.photographed && !view.embedded)) return true;
 				const corners = squareCorners(square).map((k) => view.cornerSupport!.has(k));
-				const surface = index.get(key(square))!;
-				const side = parity(square) === darkParity ? 0 : 1;
 				return (
 					(corners[0] && corners[3]) ||
 					(corners[1] && corners[2]) ||
@@ -168,7 +188,9 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 				(s.void &&
 					inside(s.square) &&
 					(!tiles.photographed ||
-						neighbors(s.square).filter((k) => visible.has(k)).length >= 3)),
+						(neighbors(s.square).filter((k) => visible.has(k)).length >= 3 &&
+							view.cornerSupport &&
+							squareCorners(s.square).every((k) => view.cornerSupport!.has(k))))),
 		)
 		.map(({ square }) => square);
 	let beyond = surfaces.filter((s) => s.void && !inside(s.square)).map(({ square }) => square);
@@ -257,9 +279,9 @@ function surfaceOf(pic: Picture, view: View, square: Square, tiles: Tiles): Surf
 		(value, channel) => value / interior / Math.max(0.05, tiles[0][channel]!),
 	);
 	brightnesses.sort((a, b) => a - b);
+	const variation = brightnesses[Math.floor(interior * 0.95)]! - brightnesses[Math.floor(interior * 0.05)]!; // prettier-ignore
 	const uniform = tiles.photographed
-		? brightnesses[Math.floor(interior * 0.95)]! - brightnesses[Math.floor(interior * 0.05)]! <
-				0.14 && dark >= 0.98 * interior
+		? variation < 0.14 && dark >= 0.98 * interior
 		: lightest - darkest < 0.04 && dark === interior;
 	const sideEvidence = perimeterEvidence(sides, tiles, tolerance);
 	const inset = 0;
@@ -280,6 +302,7 @@ function surfaceOf(pic: Picture, view: View, square: Square, tiles: Tiles): Surf
 		sides: sideEvidence.sides,
 		corners,
 		cornerEvidence: cornerEvidence(corners, tiles, tolerance),
+		variation,
 		void:
 			uniform &&
 			(Math.max(...ratios) - Math.min(...ratios) < 0.12 ||

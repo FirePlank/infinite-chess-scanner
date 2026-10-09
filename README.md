@@ -168,7 +168,7 @@ though some pieces extend below it.
 npm test
 ```
 
-Reads 46 screenshots and photos of the site and checks each against the true position up to
+Reads 49 screenshots and photos of the site and checks each against the true position up to
 translation: pieces, voids, promotion ranks and world border. They cover the 18 standard variants,
 zoom levels down to 7-pixel squares, two board themes, royals in check, black's side, perspective
 mode at several tilts and turns, browser windows, and photos with menus covering part of the board.

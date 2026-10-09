@@ -59,7 +59,7 @@ export function findTileColors(pic: Picture): Tiles {
 	const tiles = meansOfBins(pic, bins, Math.floor(best / BIN_COUNT), best % BIN_COUNT);
 	// A photographed display has repeated subpixel stripes of its own. Their tiny contrast can
 	// win exact-color votes, so average over the stripes before looking for the board's colors.
-	if (colorDistance(tiles[0], tiles[1]) < 0.15 && votes.get(best)! >= 8 && hasDisplayNoise(pic)) {
+	if (colorDistance(tiles[0], tiles[1]) < 0.15 && hasDisplayNoise(pic)) {
 		const averaged = averagedTileColors(pic);
 		if (averaged) return averaged;
 	}
@@ -81,7 +81,7 @@ function hasDisplayNoise(pic: Picture): boolean {
 
 /** Checkerboard color votes from small averaged patches, at both axis and diagonal corners. */
 function averagedTileColors(pic: Picture): Tiles | undefined {
-	const votes = new Map<number, { count: number; sums: number[] }>();
+	const votes = new Map<number, { count: number; sums: number[]; reaches: Set<number> }>();
 	const { width, height, sat } = pic;
 	const stride = (width + 1) * 3;
 	const mean = (x: number, y: number): RGB => {
@@ -115,8 +115,9 @@ function averagedTileColors(pic: Picture): Tiles | undefined {
 					let second = b.map((value, channel) => (value + d[channel]!) / 2) as RGB;
 					if (luminance(first) > luminance(second)) [first, second] = [second, first];
 					const key = bin(first) * 4096 + bin(second);
-					const vote = votes.get(key) ?? { count: 0, sums: [0, 0, 0, 0, 0, 0] };
+					const vote = votes.get(key) ?? { count: 0, sums: [0, 0, 0, 0, 0, 0], reaches: new Set<number>() }; // prettier-ignore
 					vote.count++;
+					vote.reaches.add(reach);
 					for (let channel = 0; channel < 3; channel++) {
 						vote.sums[channel]! += first[channel]!;
 						vote.sums[channel + 3]! += second[channel]!;
@@ -127,7 +128,9 @@ function averagedTileColors(pic: Picture): Tiles | undefined {
 		}
 	}
 	const best = [...votes.values()].sort((a, b) => b.count - a.count)[0];
-	if (!best || best.count < 12) return undefined;
+	// Small repeating obstacles can alternate at one reach. The same tile colors must meet at
+	// both reaches to distinguish broad checkerboard squares from those repeated marks.
+	if (!best || best.count < 12 || best.reaches.size < 2) return undefined;
 	const tiles: Tiles = [best.sums.slice(0, 3).map((value) => value / best.count) as RGB, best.sums.slice(3).map((value) => value / best.count) as RGB]; // prettier-ignore
 	tiles.photographed = true;
 	return tiles;

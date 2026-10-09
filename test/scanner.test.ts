@@ -25,8 +25,10 @@ interface Fixture {
 	perspective?: 'black';
 	/** Visible pieces and voids, guarding against an overly narrow board region. */
 	minimumPieces?: number;
-	/** Position squares covered by opaque UI, which must not count as shown. */
+	/** Position squares covered by UI or foreground objects, which must not count as shown. */
 	hiddenSquares?: string[];
+	/** Exposed squares beside an occlusion, guarding against cropping away whole rows or columns. */
+	visibleSquares?: string[];
 	/** Independently known visible world-border sides: left, right, bottom, top. */
 	worldBorderVisible?: [boolean, boolean, boolean, boolean];
 }
@@ -137,6 +139,13 @@ function check(reading: Reading, fixture: Fixture): void {
 		assert.ok(
 			!reading.shown.has(`${x + dx},${y + dy}`),
 			`Covered square ${key} counted as shown.`,
+		);
+	}
+	for (const key of fixture.visibleSquares ?? []) {
+		const [x, y] = key.split(',').map(Number) as [number, number];
+		assert.ok(
+			reading.shown.has(`${x + dx},${y + dy}`),
+			`Exposed square ${key} was excluded from the board region.`,
 		);
 	}
 
