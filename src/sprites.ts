@@ -37,47 +37,14 @@ const FINEST_KEPT_LEVEL = 3;
 /** The mipmap LOD bias of the site's piece shader. */
 const LOD_BIAS = -0.5;
 
-/** Where the build caches the rendered sprites. */
-const CACHE = new URL('./sprites.bin', import.meta.url);
-
 /** Scratch texels of {@link sampleTexture}, reused across its calls. */
 const FINE_TEXEL = new Float32Array(4);
 const COARSE_TEXEL = new Float32Array(4);
 
 // Building --------------------------------------------------------------------
 
-/** The sprite of every piece the site can draw, from the build's cache when it has one. */
-export async function loadSprites(): Promise<Sprite[]> {
-	return readCache() ?? renderSprites();
-}
-
-/** Renders every sprite and saves the cache beside this module, for later loads to skip rendering. */
-export async function cacheSprites(): Promise<void> {
-	const sprites = await renderSprites();
-	const finest = sprites.map((sprite) => sprite.levels[0]!.rgba);
-	const data = new Float32Array(finest.reduce((sum, rgba) => sum + rgba.length, 0));
-	finest.reduce((offset, rgba) => (data.set(rgba, offset), offset + rgba.length), 0);
-	fs.writeFileSync(CACHE, new Uint8Array(data.buffer));
-}
-
-/** The cached sprites, if the build cached them for the same pieces. */
-function readCache(): Sprite[] | undefined {
-	if (!fs.existsSync(CACHE)) return undefined;
-	const pieces = allPieces();
-	const size = TEXTURE_SIZE >> FINEST_KEPT_LEVEL;
-	const texels = size * size * 4;
-	const bytes = fs.readFileSync(CACHE);
-	if (bytes.byteLength !== pieces.length * texels * 4) return undefined;
-	const data = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
-	return pieces.map((piece, i) => {
-		const levels: MipLevel[] = [{ size, rgba: data.slice(i * texels, (i + 1) * texels) }];
-		while (levels.at(-1)!.size > 1) levels.push(halve(levels.at(-1)!));
-		return { piece, levels };
-	});
-}
-
 /** Renders the sprite of every piece the site can draw from its SVG. */
-async function renderSprites(): Promise<Sprite[]> {
+export async function loadSprites(): Promise<Sprite[]> {
 	const svgsById = readPieceSVGs();
 	const rasters = new Map<string, Promise<Buffer>>();
 	const pending = allPieces().map((piece) => {

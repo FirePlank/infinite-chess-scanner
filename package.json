@@ -18,7 +18,7 @@
     "node": ">=18.17"
   },
   "scripts": {
-    "build": "tsc && node dist/cache-sprites.js",
+    "build": "tsc",
     "prepare": "npm run build",
     "test": "tsx --test test/*.test.ts",
     "benchmark": "tsx bench/scanner.ts",
