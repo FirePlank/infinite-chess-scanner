@@ -163,6 +163,36 @@ for (const fixture of fixtures) {
 	});
 }
 
+// These edits preserve every visible piece and line while changing camera noise, exposure, and
+// the grid's pixel phase. The independent fixture position still supplies all expected results.
+for (const scenario of [
+	{
+		name: 'reads a photographed CoaIP board after resizing and JPEG compression',
+		image: 'coaip-photo-1.png',
+		transform: (image: Buffer) =>
+			sharp(image).resize({ width: 1800 }).jpeg({ quality: 85 }).toBuffer(),
+	},
+	{
+		name: 'reads a photographed CoaIP board after an exposure and color-cast change',
+		image: 'coaip-photo-1.png',
+		transform: (image: Buffer) =>
+			sharp(image).linear([0.92, 0.95, 0.9], [8, 4, 10]).png().toBuffer(),
+	},
+	{
+		name: 'reads a photographed CoaIP board after a crop retaining every piece',
+		image: 'coaip-photo-2.png',
+		transform: (image: Buffer) =>
+			sharp(image).extract({ left: 37, top: 29, width: 1940, height: 1440 }).png().toBuffer(),
+	},
+]) {
+	test(scenario.name, async () => {
+		const fixture = fixtures.find((fixture) => fixture.image === scenario.image);
+		assert.ok(fixture);
+		const image = fs.readFileSync(new URL(scenario.image, FIXTURES));
+		check(await readScreenshot(await scenario.transform(image)), fixture);
+	});
+}
+
 for (const scenario of [
 	{
 		name: 'reads an embedded board with an opaque menu over empty squares',
@@ -271,6 +301,38 @@ for (const scenario of [
 		});
 	});
 }
+
+test('excludes opaque foreground over an island tile and a photographed void lane', async () => {
+	const fixture = fixtures.find(({ image }) => image === '4x4x4x4-chess-photo-4.png')!;
+	const board = fs.readFileSync(new URL(fixture.image, FIXTURES));
+	// In the photo, the empty square 9,13 ends around x=1098, beside void 10,13.
+	// Cover their interiors while leaving the surrounding tiles, gaps and every piece exposed.
+	const overlay = await sharp({
+		create: { width: 108, height: 39, channels: 3, background: '#505b66' },
+	})
+		.png()
+		.toBuffer();
+	const image = await sharp(board)
+		.composite([{ input: overlay, left: 1045, top: 490 }])
+		.png()
+		.toBuffer();
+	const reading = await readScreenshot(image);
+	check(reading, {
+		...fixture,
+		// The panel hides one of the 105 voids; all 64 chess pieces remain visible.
+		minimumPieces: 168,
+		hiddenSquares: ['9,13', '10,13'],
+		visibleSquares: [
+			...(fixture.visibleSquares ?? []),
+			'8,13',
+			'9,14',
+			'9,12',
+			'11,13',
+			'10,14',
+			'10,12',
+		],
+	});
+});
 
 test('rejects squares too small to read', async () => {
 	const file = new URL('space-too-far.png', FIXTURES);

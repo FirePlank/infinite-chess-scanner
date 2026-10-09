@@ -165,16 +165,18 @@ export function findPromotionLines(
 	squares: Square[],
 	tiles: Tiles,
 ): number[] {
-	const readable = new Map(squares.map((square) => [`${square.column},${square.row}`, square]));
+	if (tiles.photographed) return photographPromotionLines(pic, view, squares);
+	const readable = new Map(squares.map((square) => [square.column + ',' + square.row, square]));
 	const extent = extentOf(squares);
 	const lines: number[] = [];
-	for (let k = extent.top; k <= extent.bottom + 1; k++) {
+	for (let row = extent.top; row <= extent.bottom + 1; row++) {
 		let length = 0;
 		for (let column = extent.left; column <= extent.right; column++) {
-			const square = readable.get(`${column},${k}`) ?? readable.get(`${column},${k - 1}`);
-			if (square) length += lineAlong(pic, view, tiles, column, k, square.size);
+			const square =
+				readable.get(column + ',' + row) ?? readable.get(column + ',' + (row - 1));
+			if (square) length += lineAlong(pic, view, tiles, column, row, square.size);
 		}
-		if (length >= LINE_MIN_SQUARES) lines.push(k);
+		if (length >= LINE_MIN_SQUARES) lines.push(row);
 	}
 	return lines;
 }
@@ -188,7 +190,6 @@ function lineAlong(
 	k: number,
 	size: number,
 ): number {
-	if (tiles.photographed) return photographedLineAlong(pic, view, column, k, size);
 	const reach = Math.max(2, Math.floor(size / 4));
 	const steps = Math.max(1, Math.ceil(size));
 	let length = 0;
@@ -206,74 +207,279 @@ function lineAlong(
 	return length;
 }
 
-/**
- * Camera exposure and display stripes vary across a photograph. Compare a thin line with the
- * adjacent tiles at the same location, averaging along it to suppress the display's pixel pattern.
- */
-function photographedLineAlong(
-	pic: Picture,
-	view: View,
-	column: number,
-	k: number,
-	size: number,
-): number {
-	const reach = Math.max(3, size / 4);
-	const steps = Math.max(1, Math.ceil(size));
-	let length = 0;
-	for (let i = 0; i < steps; i++) {
-		const u = column + (i + 0.5) / steps;
-		const [x, y] = project(view.toImage, u, k);
-		const [nextX, nextY] = project(view.toImage, u, k + 0.01);
-		const across = Math.hypot(nextX - x, nextY - y);
-		const [nx, ny] = [(nextX - x) / across, (nextY - y) / across];
-		const [alongX, alongY] = project(view.toImage, u + 0.01, k);
-		const along = Math.hypot(alongX - x, alongY - y);
-		const [tx, ty] = [(alongX - x) / along, (alongY - y) / along];
-		const before = averagedAt(pic, x - reach * nx, y - reach * ny, tx, ty);
-		const after = averagedAt(pic, x + reach * nx, y + reach * ny, tx, ty);
-		if (!before || !after || colorDistance(before, after) < 0.12) continue;
-		// Both sides must keep alternating in the adjacent column. This excludes a UI edge
-		// meeting the board, even when its gray happens to resemble one tile color.
-		let alternates = false;
-		for (const direction of [-1, 1]) {
-			const [adjacentX, adjacentY] = project(view.toImage, u + direction, k);
-			const adjacentBefore = averagedAt(
-				pic,
-				adjacentX - reach * nx,
-				adjacentY - reach * ny,
-				tx,
-				ty,
-			);
-			const adjacentAfter = averagedAt(
-				pic,
-				adjacentX + reach * nx,
-				adjacentY + reach * ny,
-				tx,
-				ty,
-			);
-			if (adjacentBefore && adjacentAfter && colorDistance(before, adjacentAfter) < 0.15 && colorDistance(after, adjacentBefore) < 0.15) alternates = true; // prettier-ignore
-		}
-		if (!alternates) continue;
-		const dark = Math.min(luminance(before), luminance(after));
-		let onLine = false;
-		for (let shift = -2; shift <= 2; shift += 0.5) {
-			const color = averagedAt(pic, x + shift * nx, y + shift * ny, tx, ty);
-			if (color && luminance(color) < dark - 0.07) onLine = true;
-		}
-		if (onLine) length += 1 / steps;
-	}
-	// Display stripes can leave isolated dark samples. A drawn line persists through most of a tile.
-	return length >= 0.5 ? length : 0;
+interface BoundaryProfile {
+	before: RGB;
+	after: RGB;
+	colors: RGB[];
 }
 
-/** The mean color of a short strip in a direction, or absent if it leaves the image. */
-function averagedAt(pic: Picture, x: number, y: number, tx: number, ty: number): RGB | undefined {
+interface BoundaryStrip {
+	noise: number;
+	sidebands: RGB[];
+	residuals: RGB[];
+}
+
+interface BoundaryCell extends BoundaryStrip {
+	column: number;
+}
+
+interface BoundaryRow {
+	row: number;
+	cells: BoundaryCell[];
+}
+
+/**
+ * A camera line is a coherent RGB departure from the local tile transition. Each row uses one
+ * bounded image phase across its cells, rather than independently picking every strip's darkest
+ * camera stripe. Off-boundary strips estimate the noise; separated probes and cells establish the
+ * line's persistence. Gray, colored and nearly equal tile colors use this same observation model.
+ */
+function photographPromotionLines(pic: Picture, view: View, squares: Square[]): number[] {
+	const readable = new Map(squares.map((square) => [square.column + ',' + square.row, square]));
+	const extent = extentOf(squares);
+	const evidence: { row: number; confidence: number }[] = [];
+	const rows: BoundaryRow[] = [];
+	for (let row = extent.top; row <= extent.bottom + 1; row++) {
+		const cells = boundaryCells(pic, view, readable, extent, row);
+		if (cells.length >= LINE_MIN_SQUARES) rows.push({ row, cells });
+	}
+	// Ordinary checker transitions calibrate the RGB fringe noise near each candidate row.
+	// Leave the candidate out so its drawn line cannot set its own significance threshold.
+	for (const { row, cells } of rows) {
+		const nearby = rows.filter((other) => other.row !== row && Math.abs(other.row - row) <= 3);
+		for (const cell of cells) {
+			const local = (
+				nearby.length ? nearby : rows.filter((other) => other.row !== row)
+			).flatMap(({ cells }) =>
+				cells.filter((other) => Math.abs(other.column - cell.column) <= 1),
+			);
+			if (local.length === 0) continue;
+			const transitionNoise = Math.max(
+				0.003,
+				median(
+					local.flatMap(({ residuals }) =>
+						residuals.map((residual) => Math.hypot(...residual) / Math.sqrt(3)),
+					),
+				) / 1.5,
+			);
+			cell.noise = Math.max(cell.noise, transitionNoise);
+		}
+		const confidence = boundaryConfidence(cells);
+		if (confidence > 0) evidence.push({ row, confidence });
+	}
+	// Both players contribute the same number of ranks. An unpaired weak ridge is more likely
+	// camera noise; retain the even set with the greatest total independent boundary evidence.
+	if (evidence.length % 2 !== 0) {
+		let weakest = 0;
+		for (let i = 1; i < evidence.length; i++)
+			if (evidence[i]!.confidence < evidence[weakest]!.confidence) weakest = i;
+		evidence.splice(weakest, 1);
+	}
+	return evidence.map(({ row }) => row);
+}
+
+/** The independent strip observations retained for a row of exposed neighboring checker tiles. */
+function boundaryCells(
+	pic: Picture,
+	view: View,
+	readable: ReadonlyMap<string, Square>,
+	extent: Extent,
+	row: number,
+): BoundaryCell[] {
+	const observed = new Map<number, { profiles: (BoundaryProfile | undefined)[] }>();
+	for (let column = extent.left; column <= extent.right; column++) {
+		const square = readable.get(column + ',' + row) ?? readable.get(column + ',' + (row - 1));
+		if (!square) continue;
+		observed.set(column, {
+			profiles: [0.25, 0.5, 0.75].map((part) =>
+				boundaryProfile(pic, view, column + part, row, square.size),
+			),
+		});
+	}
+	const cells: BoundaryCell[] = [];
+	for (const [column, { profiles }] of observed) {
+		const probes: BoundaryStrip[] = [];
+		for (let part = 0; part < profiles.length; part++) {
+			const profile = profiles[part];
+			if (!profile) continue;
+			const contrast = colorDistance(profile.before, profile.after);
+			const compatible = [-1, 1].some((direction) => {
+				const adjacent = observed.get(column + direction)?.profiles[part];
+				if (!adjacent) return false;
+				const alternating = Math.max(
+					colorDistance(profile.before, adjacent.after),
+					colorDistance(profile.after, adjacent.before),
+				);
+				const uniform = Math.max(
+					contrast,
+					colorDistance(profile.before, adjacent.before),
+					colorDistance(profile.after, adjacent.after),
+				);
+				return Math.min(alternating, uniform) < Math.max(0.07, 0.65 * contrast);
+			});
+			if (!compatible) continue;
+			const flank = 2 + 2 * Math.min(1, contrast / 0.12);
+			const residual = (shift: number): RGB => boundaryResidual(profile, shift, flank);
+			// These sidebands exclude the fitted boundary and retain broad as well as fine moire.
+			const sidebands = [-10, -9, -8, -7, -6, -5, 5, 6, 7, 8, 9, 10].map(residual);
+			const noise = Math.max(
+				0.003,
+				median(sidebands.map((value) => Math.hypot(...value) / Math.sqrt(3))) / 1.5,
+			);
+			const residuals: RGB[] = [];
+			for (let shift = -3; shift <= 3; shift += 0.5) residuals.push(residual(shift));
+			probes.push({ noise, residuals, sidebands });
+		}
+		if (probes.length < 2) continue;
+		cells.push({
+			column,
+			noise: median(probes.map((probe) => probe.noise)),
+			sidebands: probes[0]!.sidebands.map(
+				(_, phase) =>
+					[0, 1, 2].map((channel) =>
+						median(probes.map((probe) => probe.sidebands[phase]![channel]!)),
+					) as RGB,
+			),
+			residuals: probes[0]!.residuals.map(
+				(_, phase) =>
+					[0, 1, 2].map((channel) =>
+						median(probes.map((probe) => probe.residuals[phase]![channel]!)),
+					) as RGB,
+			),
+		});
+	}
+	return cells;
+}
+
+/** The strongest boundary-locked RGB ridge, evaluated at a single phase for the whole row. */
+function boundaryConfidence(cells: BoundaryCell[]): number {
+	// Equal cell contributions let differently phased RGB fringes cancel instead of favoring quiet dips.
+	let confidence = 0;
+	for (let phase = 0; phase < 13; phase++) {
+		const mean: RGB = [0, 0, 0];
+		let supported = 0;
+		for (const cell of cells) {
+			const residual = cell.residuals[phase]!;
+			for (let channel = 0; channel < 3; channel++) mean[channel]! += residual[channel]!;
+			if (
+				-luminance(residual) > 0.02 &&
+				Math.hypot(...residual) / Math.sqrt(3) > 2.5 * cell.noise
+			)
+				supported++;
+		}
+		for (let channel = 0; channel < 3; channel++) mean[channel]! /= cells.length;
+		// Keep the noise of a whole strip: its pixels and neighboring cells are correlated.
+		const noise = median(cells.map((cell) => cell.noise));
+		const amplitude = Math.hypot(...mean);
+		const repeated = cells[0]!.sidebands.map((_, offset) => {
+			let projection = 0;
+			for (const cell of cells)
+				projection += cell.sidebands[offset]!.reduce(
+					(sum, value, channel) => sum + value * mean[channel]!,
+					0,
+				);
+			return projection / cells.length / Math.max(1e-9, amplitude);
+		});
+		const sidePeak = Math.max(...repeated);
+		if (
+			supported >= LINE_MIN_SQUARES &&
+			luminance(mean) < 0 &&
+			amplitude / Math.sqrt(3) > noise &&
+			amplitude > sidePeak
+		) {
+			confidence = Math.max(confidence, (amplitude - sidePeak) / noise);
+		}
+	}
+	return confidence;
+}
+
+/** A continuous, along-boundary strip profile in camera pixels, centered on the fitted grid. */
+function boundaryProfile(
+	pic: Picture,
+	view: View,
+	u: number,
+	row: number,
+	size: number,
+): BoundaryProfile | undefined {
+	const [x, y] = project(view.toImage, u, row);
+	const [alongX, alongY] = project(view.toImage, u + 0.01, row);
+	const [acrossX, acrossY] = project(view.toImage, u, row + 0.01);
+	const along = Math.hypot(alongX - x, alongY - y);
+	const across = Math.hypot(acrossX - x, acrossY - y);
+	const [tx, ty] = [(alongX - x) / along, (alongY - y) / along];
+	const [nx, ny] = [(acrossX - x) / across, (acrossY - y) / across];
+	const at = (shift: number): RGB | undefined =>
+		averagedAt(pic, x + shift * nx, y + shift * ny, tx, ty, 8);
+	const before = at(-size / 4);
+	const after = at(size / 4);
+	if (!before || !after) return undefined;
+	const colors: RGB[] = [];
+	for (let shift = -14; shift <= 14; shift += 0.5) {
+		const color = at(shift);
+		if (!color) return undefined;
+		colors.push(color);
+	}
+	return { before, after, colors };
+}
+
+/** The RGB component a narrow profile cannot explain as a blend of its neighboring flanks. */
+function boundaryResidual(profile: BoundaryProfile, shift: number, flank: number): RGB {
+	const at = (offset: number): RGB => {
+		const index = (offset + 14) * 2;
+		const low = Math.floor(index);
+		const fraction = index - low;
+		return [0, 1, 2].map(
+			(channel) =>
+				profile.colors[low]![channel]! * (1 - fraction) +
+				profile.colors[Math.min(low + 1, profile.colors.length - 1)]![channel]! * fraction,
+		) as RGB;
+	};
+	const color = at(shift),
+		before = at(shift - flank),
+		after = at(shift + flank);
+	const axis = after.map((value, channel) => value - before[channel]!) as RGB;
+	const squared = axis.reduce((sum, value) => sum + value * value, 0);
+	const dot = axis.reduce(
+		(sum, value, channel) => sum + value * (color[channel]! - before[channel]!),
+		0,
+	);
+	const blend = Math.max(0, Math.min(1, dot / Math.max(1e-9, squared)));
+	return color.map((value, channel) => value - before[channel]! - blend * axis[channel]!) as RGB;
+}
+
+function median(values: number[]): number {
+	values.sort((a, b) => a - b);
+	return values[Math.floor(values.length / 2)]!;
+}
+
+/** Bilinear strip sampling avoids discontinuous evidence when the grid moves a fraction of a pixel. */
+function averagedAt(
+	pic: Picture,
+	x: number,
+	y: number,
+	tx: number,
+	ty: number,
+	radius: number,
+): RGB | undefined {
 	const mean: RGB = [0, 0, 0];
-	for (let step = -2; step <= 2; step++) {
-		const pixel = pixelAt(pic, x + step * tx, y + step * ty);
-		if (pixel < 0) return undefined;
-		const color = colorAt(pic, pixel);
-		for (let channel = 0; channel < 3; channel++) mean[channel]! += color[channel]! / 5;
+	const samples = 2 * radius + 1;
+	for (let step = -radius; step <= radius; step++) {
+		const px = x + step * tx - 0.5,
+			py = y + step * ty - 0.5;
+		const ix = Math.floor(px),
+			iy = Math.floor(py);
+		if (ix < 0 || iy < 0 || ix + 1 >= pic.width || iy + 1 >= pic.height) return undefined;
+		const fx = px - ix,
+			fy = py - iy;
+		const at = (iy * pic.width + ix) * 3;
+		for (let channel = 0; channel < 3; channel++) {
+			mean[channel]! +=
+				(pic.rgb[at + channel]! * (1 - fx) * (1 - fy) +
+					pic.rgb[at + 3 + channel]! * fx * (1 - fy) +
+					pic.rgb[at + pic.width * 3 + channel]! * (1 - fx) * fy +
+					pic.rgb[at + (pic.width + 1) * 3 + channel]! * fx * fy) /
+				samples;
+		}
 	}
 	return mean;
 }

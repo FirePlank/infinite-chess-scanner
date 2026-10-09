@@ -82,19 +82,21 @@ export function samplePatch(
 	const step = extent / samples;
 	for (let sy = 0; sy < samples; sy++) {
 		for (let sx = 0; sx < samples; sx++) {
-			const [u, v] = [left + (sx + 0.5) * step, top + (sy + 0.5) * step];
+			const u = left + (sx + 0.5) * step;
+			const v = top + (sy + 0.5) * step;
 			const w = h6 * u + h7 * v + h8;
 			const x = (h0 * u + h1 * v + h2) / w;
 			const y = (h3 * u + h4 * v + h5) / w;
 			const across = Math.max(Math.abs(h0 - x * h6) + Math.abs(h3 - y * h6), Math.abs(h1 - x * h7) + Math.abs(h4 - y * h7)) * (step / w); // prettier-ignore
 			const points = Math.min(MAX_SUBSAMPLES, Math.max(1, Math.ceil(2 * across)));
+			const weight = 1 / (points * points);
 			const at = (sy * samples + sx) * 3;
 			for (let j = 0; j < points; j++) {
 				const pv = top + (sy + (j + 0.5) / points) * step;
 				for (let i = 0; i < points; i++) {
 					const pu = left + (sx + (i + 0.5) / points) * step;
 					const pw = h6 * pu + h7 * pv + h8;
-					addBilinear(pic, (h0 * pu + h1 * pv + h2) / pw, (h3 * pu + h4 * pv + h5) / pw, 1 / (points * points), patch, at); // prettier-ignore
+					addBilinear(pic, (h0 * pu + h1 * pv + h2) / pw, (h3 * pu + h4 * pv + h5) / pw, weight, patch, at); // prettier-ignore
 				}
 			}
 		}
@@ -119,12 +121,22 @@ function addBilinear(
 	const y1 = Math.min(y0 + 1, pic.height - 1);
 	const tx = fx - x0;
 	const ty = fy - y0;
-	const [a, b, c, d] = [(y0 * pic.width + x0) * 3, (y0 * pic.width + x1) * 3, (y1 * pic.width + x0) * 3, (y1 * pic.width + x1) * 3]; // prettier-ignore
-	for (let k = 0; k < 3; k++) {
-		const top = pic.rgb[a + k]! * (1 - tx) + pic.rgb[b + k]! * tx;
-		const bottom = pic.rgb[c + k]! * (1 - tx) + pic.rgb[d + k]! * tx;
-		out[at + k]! += weight * (top * (1 - ty) + bottom * ty);
-	}
+	const a = (y0 * pic.width + x0) * 3;
+	const b = (y0 * pic.width + x1) * 3;
+	const c = (y1 * pic.width + x0) * 3;
+	const d = (y1 * pic.width + x1) * 3;
+	const inverseX = 1 - tx;
+	const inverseY = 1 - ty;
+	const { rgb } = pic;
+	const topR = rgb[a]! * inverseX + rgb[b]! * tx;
+	const bottomR = rgb[c]! * inverseX + rgb[d]! * tx;
+	out[at]! += weight * (topR * inverseY + bottomR * ty);
+	const topG = rgb[a + 1]! * inverseX + rgb[b + 1]! * tx;
+	const bottomG = rgb[c + 1]! * inverseX + rgb[d + 1]! * tx;
+	out[at + 1]! += weight * (topG * inverseY + bottomG * ty);
+	const topB = rgb[a + 2]! * inverseX + rgb[b + 2]! * tx;
+	const bottomB = rgb[c + 2]! * inverseX + rgb[d + 2]! * tx;
+	out[at + 2]! += weight * (topB * inverseY + bottomB * ty);
 }
 
 /**

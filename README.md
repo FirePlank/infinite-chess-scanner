@@ -146,6 +146,8 @@ sideways, the farthest on squares about 15 pixels across.
   in `reading.shown` say anything about the position.
 - **Covered squares**: a square even partly covered by a menu or an object is left out of
   `reading.shown`, and what's under it isn't guessed.
+- **Photos**: the screen must show flat. Lens distortion, a curved screen, blur, glare or heavy
+  compression can hide what tells pieces apart.
 - **What's drawn over the board**: arrows, annotations and legal move dots aren't understood, and
   can throw off the squares under them. Move highlights are fine.
 - **Black's side** must be asked for with `--black`. Without it, the position reads rotated 180°.
@@ -160,12 +162,16 @@ sideways, the farthest on squares about 15 pixels across.
 npm test
 ```
 
-Reads 49 screenshots and photos of the site and checks each against the true position up to
+Reads 63 screenshots and photos of the site and checks each against the true position up to
 translation: pieces, voids, promotion ranks and world border. They cover the 18 standard variants,
-zoom levels down to 7-pixel squares, two board themes, royals in check, black's side, perspective
-mode at several tilts and turns, a whole browser window, and photos of the screen with things in
-front of it. Five more lay menus over a screenshot, one in a tile color and one over part of a
-piece. One more, zoomed out too far, must be refused.
+zoom levels down to 7-pixel squares, several board themes, royals in check, black's side,
+perspective mode at several tilts and turns, a whole browser window, photos of the screen with
+things in front of it, and the separate islands of 4D boards. More lay menus over screenshots,
+resize, recompress and recolor photos, and draw boards straight from the sprites with new themes and
+camera noise, checking that nothing is invented. One more, zoomed out too far, must be refused.
+
+`npm run benchmark` times warm reads of a few screenshots and photos. Name fixtures after `--` to
+time those instead.
 
 ---
 
