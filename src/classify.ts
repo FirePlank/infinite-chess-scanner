@@ -21,6 +21,7 @@ import {
 	meanColor,
 	patchSums,
 	rankFits,
+	refinePhotoFits,
 } from './matcher.js';
 import { royalCounterpart } from './pieces.js';
 import { sampleTexture, textureLod } from './sprites.js';
@@ -45,7 +46,8 @@ interface PixelSet {
 }
 
 /** What one square holds. */
-export type Verdict = { kind: 'empty' } | { kind: 'void' } | { kind: 'piece'; piece: Piece };
+export type Verdict =
+	{ kind: 'empty' } | { kind: 'void' } | { kind: 'obscured' } | { kind: 'piece'; piece: Piece };
 
 // Constants -------------------------------------------------------------------
 
@@ -80,14 +82,36 @@ export function classify(
 	const matcher = matchers(sizeClass);
 
 	const sums = patchSums(matcher, patch);
-	const ranked = rankFits(matcher, patch, sums);
+	let ranked = rankFits(matcher, patch, sums);
+	if (matcher.photographed) {
+		ranked = refinePhotoFits(matcher, patch, sums, ranked);
+	}
 	const background = fitTemplate(matcher.empty, matcher, patch, sums);
+	const samples = matcher.mask.reduce((sum, kept) => sum + kept, 0);
+	const unexplained = matcher.photographed
+		? 0.06 + 2 * Math.min(0.03, ranked[0]!.noise ?? 0)
+		: 0.04;
+	const unexplainedRatio = matcher.photographed ? 0.45 : PIECE_FIT_RATIO;
+	if (
+		Math.min(ranked[0]!.residual, background.residual) > unexplained * samples &&
+		ranked[0]!.residual > unexplainedRatio * background.residual
+	) {
+		return { kind: 'obscured' };
+	}
 	if (ranked[0]!.residual > PIECE_FIT_RATIO * background.residual)
 		return backgroundVerdict(mean, darkTile);
 	const finalists = ranked
+		.filter(
+			(fit) =>
+				!matcher.photographed ||
+				fit.template.sprite!.piece.player === ranked[0]!.template.sprite!.piece.player,
+		) // prettier-ignore
 		.slice(0, FINALIST_COUNT)
 		.filter((fit) => fit.residual <= FINALIST_MARGIN * ranked[0]!.residual);
-	const best = finalists.length > 1 ? settle(reader, square, finalists) : ranked[0]!;
+	const best =
+		!matcher.photographed && finalists.length > 1
+			? settle(reader, square, finalists)
+			: ranked[0]!;
 
 	const piece = best.template.sprite!.piece;
 	const royal = royalCounterpart(piece);

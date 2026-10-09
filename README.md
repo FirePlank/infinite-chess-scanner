@@ -1,7 +1,7 @@
 # Infinite Chess Scanner
 
-Reads the position off a screenshot of an [Infinite Chess](https://www.infinitechess.org/) board and
-writes it as ICN, ready to paste back into the site.
+Reads the position off a screenshot or photo of an [Infinite Chess](https://www.infinitechess.org/)
+board and writes it as ICN, ready to paste back into the site.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
 
@@ -11,6 +11,9 @@ writes it as ICN, ready to paste back into the site.
   pixel. No calibration, no cropping to exact squares.
 - **Perspective mode**: reads boards seen at an angle too, at any tilt and turn, by fitting the
   board's projection from its checkerboard corners.
+- **Automatic board regions**: finds the board within a browser window or a photo of a screen. Menus
+  and other opaque objects can leave holes, irregular outlines or disconnected visible regions;
+  covered squares are excluded from the reading.
 - **Every piece**: all 21 piece types and voids, for white, black and neutral, plus the red, blue,
   yellow and green players.
 - **Pixel-exact matching**: renders each sprite the way the site's WebGL does, so pieces that differ
@@ -18,7 +21,8 @@ writes it as ICN, ready to paste back into the site.
 - **Highlights and checks**: a square's background is fitted rather than assumed, so move highlights
   don't get in the way, and the red glow of a royal in check marks it as royal.
 - **Promotion lines and world borders**: read wherever they show, and written into the ICN.
-- **Fast**: a few hundred milliseconds a screenshot, with several read at once across every core.
+- **Fast screenshots**: usually a few hundred milliseconds for a direct screenshot. Photos can take
+  several seconds. Several images can be read at once across every core.
 
 ## Quick Start
 
@@ -64,8 +68,8 @@ reading.icn; //         'w 1 (4|-3) r-3,4|n-2,4|b-1,4|...'
 reading.pieces; //      [{ abbreviation: 'r', x: -3, y: 4 }, ...]
 reading.promotion; //   { white: [4], black: [-3] }, or undefined
 reading.worldBorder; // { left, right, bottom, top }, null on open sides, or undefined
-reading.shown; //       Set { '-14,8', ... }, every board square read
-reading.area; //        { left: -14, right: 15, bottom: -7, top: 8 }, the box around them
+reading.shown; //       Set { '-14,8', ... }, every fully visible board square read
+reading.area; //        { left: -14, right: 15, bottom: -7, top: 8 }, bounding box including border exterior
 reading.squareSize; //  50.53, in pixels, of the largest square
 reading.perspective; // false, or true when the board is seen at an angle
 ```
@@ -82,9 +86,9 @@ Install it into another project with `npm install github:FirePlank/infinite-ches
 w 1 (4|-3) r-3,4|n-2,4|b-1,4|q0,4|k1,4|b2,4|n3,4|r4,4|p-3,3|p-2,3|p-1,3|p0,3|p1,3|p2,3|p3,3|p4,3|P-3,-2|P-2,-2|P-1,-2|P0,-2|P1,-2|P2,-2|P3,-2|P4,-2|R-3,-3|N-2,-3|B-1,-3|Q0,-3|K1,-3|B2,-3|N3,-3|R4,-3
 ```
 
-A screenshot can't tell where on the infinite board it is, so the middle square of the screenshot
-becomes 0,0. Here that puts the white king on `1,-3` rather than `5,1`, with every piece in the
-right place relative to the others.
+A screenshot can't tell where on the infinite board it is, so the middle square of the visible board
+region's bounding box becomes 0,0. Here that puts the white king on `1,-3` rather than `5,1`, with
+every piece in the right place relative to the others.
 
 ### Royals in Check
 
@@ -118,17 +122,19 @@ w 1 (-6|-18) p-21,-2|ha-20,-2|ha-19,-2|r-18,-2|ha-17,-2|ha-16,-2|p-15,-2|p-20,-3
 All 78 pieces of Abundance and both promotion lines, read at a grazing angle with the board turned
 sideways, the farthest on squares about 15 pixels across.
 
-## Taking a Screenshot
+## Taking a Screenshot or Photo
 
-- Crop away the site's menus and bars. Anything covering the board's edge reads as the edge of the
-  board.
+- The board can occupy part of the image. Keep enough exposed checkerboard to identify its grid; the
+  scanner detects the board automatically around menus and bars.
 - Zoom so squares are at least 7 pixels wide. Larger is safer.
-- Save as PNG. Heavy JPEG compression blurs pieces into each other.
+- Save screenshots as PNG when possible. JPEG photos are supported, but heavy compression, blur and
+  glare can hide the details needed to distinguish pieces.
 
 ## Limitations
 
-- **Relative coordinates**: the screenshot's middle square becomes 0,0, nudged so that dark squares
-  have an even x+y as on the site. The real coordinates can't be known.
+- **Relative coordinates**: the middle square of the visible board region's bounding box becomes
+  0,0, nudged so that dark squares have an even x+y as on the site. Exact board coordinates can't be
+  known from the image; the pieces' positions relative to each other are preserved.
 - **Hidden state**: special rights, whose turn it is, the move rule and clocks don't show on the
   board. The ICN says white to move on move 1, with no special rights.
 - **Promotion**: read only when both sides' lines show, with the upper half of the lines taken as
@@ -140,6 +146,8 @@ sideways, the farthest on squares about 15 pixels across.
 - **Squares under 6.5 pixels** are refused rather than guessed. In perspective mode that's measured
   across a square's narrower side, so the far part of the board is left unread, and only the squares
   in `reading.shown` say anything about the position.
+- **Occlusion**: squares covered by opaque menus or foreground objects are excluded from
+  `reading.shown`, including partially covered squares. Pieces hidden there are not reconstructed.
 - **What's drawn over the board**: arrows, annotations and legal move dots aren't understood, and
   can throw off the squares under them. Move highlights are fine.
 - **Black's side** must be asked for with `--black`. Without it, the position reads rotated 180°.
@@ -154,10 +162,13 @@ sideways, the farthest on squares about 15 pixels across.
 npm test
 ```
 
-Reads 39 screenshots of the site and checks each against the true position up to translation:
-pieces, voids, promotion ranks and world border. They cover the 18 standard variants, zoom levels
-down to 7-pixel squares, two board themes, royals in check, black's side, and perspective mode at
-several tilts and turns. One more, zoomed out too far, must be refused.
+Reads 46 screenshots and photos of the site and checks each against the true position up to
+translation: pieces, voids, promotion ranks and world border. They cover the 18 standard variants,
+zoom levels down to 7-pixel squares, two board themes, royals in check, black's side, perspective
+mode at several tilts and turns, browser windows, and photos with menus covering part of the board.
+Five synthetic images check embedded boards, menus matching a tile color, partially covered pieces,
+disconnected visible regions, and an irregular outline at the image boundary. One more fixture,
+zoomed out too far, must be refused.
 
 ---
 

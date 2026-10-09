@@ -10,7 +10,7 @@ import type { SampledSquare } from './matcher.js';
 import type { Tiles } from './tiles.js';
 import type { Square, View } from './view.js';
 
-import { colorDistance } from './color.js';
+import { colorDistance, luminance } from './color.js';
 import { project } from './homography.js';
 import { colorAt } from './picture.js';
 import { isTileColor, projectOntoTiles } from './tiles.js';
@@ -188,6 +188,7 @@ function lineAlong(
 	k: number,
 	size: number,
 ): number {
+	if (tiles.photographed) return photographedLineAlong(pic, view, column, k, size);
 	const reach = Math.max(2, Math.floor(size / 4));
 	const steps = Math.max(1, Math.ceil(size));
 	let length = 0;
@@ -203,6 +204,78 @@ function lineAlong(
 		if (onLine) length += 1 / steps;
 	}
 	return length;
+}
+
+/**
+ * Camera exposure and display stripes vary across a photograph. Compare a thin line with the
+ * adjacent tiles at the same location, averaging along it to suppress the display's pixel pattern.
+ */
+function photographedLineAlong(
+	pic: Picture,
+	view: View,
+	column: number,
+	k: number,
+	size: number,
+): number {
+	const reach = Math.max(3, size / 4);
+	const steps = Math.max(1, Math.ceil(size));
+	let length = 0;
+	for (let i = 0; i < steps; i++) {
+		const u = column + (i + 0.5) / steps;
+		const [x, y] = project(view.toImage, u, k);
+		const [nextX, nextY] = project(view.toImage, u, k + 0.01);
+		const across = Math.hypot(nextX - x, nextY - y);
+		const [nx, ny] = [(nextX - x) / across, (nextY - y) / across];
+		const [alongX, alongY] = project(view.toImage, u + 0.01, k);
+		const along = Math.hypot(alongX - x, alongY - y);
+		const [tx, ty] = [(alongX - x) / along, (alongY - y) / along];
+		const before = averagedAt(pic, x - reach * nx, y - reach * ny, tx, ty);
+		const after = averagedAt(pic, x + reach * nx, y + reach * ny, tx, ty);
+		if (!before || !after || colorDistance(before, after) < 0.12) continue;
+		// Both sides must keep alternating in the adjacent column. This excludes a UI edge
+		// meeting the board, even when its gray happens to resemble one tile color.
+		let alternates = false;
+		for (const direction of [-1, 1]) {
+			const [adjacentX, adjacentY] = project(view.toImage, u + direction, k);
+			const adjacentBefore = averagedAt(
+				pic,
+				adjacentX - reach * nx,
+				adjacentY - reach * ny,
+				tx,
+				ty,
+			);
+			const adjacentAfter = averagedAt(
+				pic,
+				adjacentX + reach * nx,
+				adjacentY + reach * ny,
+				tx,
+				ty,
+			);
+			if (adjacentBefore && adjacentAfter && colorDistance(before, adjacentAfter) < 0.15 && colorDistance(after, adjacentBefore) < 0.15) alternates = true; // prettier-ignore
+		}
+		if (!alternates) continue;
+		const dark = Math.min(luminance(before), luminance(after));
+		let onLine = false;
+		for (let shift = -2; shift <= 2; shift += 0.5) {
+			const color = averagedAt(pic, x + shift * nx, y + shift * ny, tx, ty);
+			if (color && luminance(color) < dark - 0.07) onLine = true;
+		}
+		if (onLine) length += 1 / steps;
+	}
+	// Display stripes can leave isolated dark samples. A drawn line persists through most of a tile.
+	return length >= 0.5 ? length : 0;
+}
+
+/** The mean color of a short strip in a direction, or absent if it leaves the image. */
+function averagedAt(pic: Picture, x: number, y: number, tx: number, ty: number): RGB | undefined {
+	const mean: RGB = [0, 0, 0];
+	for (let step = -2; step <= 2; step++) {
+		const pixel = pixelAt(pic, x + step * tx, y + step * ty);
+		if (pixel < 0) return undefined;
+		const color = colorAt(pic, pixel);
+		for (let channel = 0; channel < 3; channel++) mean[channel]! += color[channel]! / 5;
+	}
+	return mean;
 }
 
 /** The index of the pixel holding a point, or -1 if the image doesn't. */

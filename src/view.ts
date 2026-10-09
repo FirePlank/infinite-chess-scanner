@@ -44,6 +44,10 @@ export interface View extends Plane {
 	squares: Square[];
 	/** Whether the board is seen at an angle. */
 	perspective: boolean;
+	/** Whether broad application bars surround the board viewport. */
+	embedded?: true;
+	/** Checkerboard intersections supported by local image evidence, as `column,row`. */
+	cornerSupport?: ReadonlySet<string>;
 }
 
 // Constants -------------------------------------------------------------------
@@ -86,16 +90,57 @@ export function findViews(pic: Picture, tiles: Tiles): View[] {
 	} catch (error) {
 		gridError = error;
 	}
-	if (grid && areGridCornersShown(pic, classes, grid)) return [flatView(grid)];
-	const corners = findCorners(pic, classes);
-	if (grid && isGridOnCorners(grid, corners)) return [flatView(grid)];
-	const homographies = fitLattice(corners, pic.width, pic.height);
+	if (grid && !tiles.photographed && areGridCornersShown(pic, classes, grid))
+		return [flatView(grid)];
+	const corners = findCorners(pic, classes, tiles.photographed ? shades : undefined);
+	if (grid && !tiles.photographed && isGridOnCorners(grid, corners)) return [flatView(grid)];
+	const homographies = fitLattice(corners, pic.width, pic.height, tiles.photographed, tiles.photographed ? (h, centers) => photoCheckered(pic, shades, h, centers) : undefined); // prettier-ignore
 	if (homographies) {
-		const views = homographies.map((toImage) => perspectiveView(pic, toImage));
-		if (isCheckered(pic, tiles, views[0]!)) return views;
+		const center = tiles.photographed ? undefined : viewportCenter(pic, shades);
+		const views = homographies.map((toImage) => perspectiveView(pic, toImage, tiles.photographed, center, corners)); // prettier-ignore
+		if (tiles.photographed || isCheckered(pic, tiles, views[0]!)) return views;
 	}
-	if (grid) return [flatView(grid)];
-	throw gridError;
+	if (grid && !tiles.photographed) return [flatView(grid)];
+	throw gridError ?? new Error('No checkerboard with readable squares found in the image.');
+}
+
+/** The center of a board viewport embedded between broad application bars. */
+function viewportCenter(pic: Picture, shades: Float32Array): Point | undefined {
+	const rows: number[] = [];
+	for (let y = 0; y < pic.height; y++) {
+		let dark = 0;
+		let light = 0;
+		for (let x = 0; x < pic.width; x++) {
+			const shade = shades[y * pic.width + x]!;
+			if (shade < 0.2) dark++;
+			else if (shade > 0.8) light++;
+		}
+		if (Math.min(dark, light) > pic.width * 0.1) rows.push(y);
+	}
+	const first = rows[0];
+	const last = rows.at(-1);
+	if (first === undefined || last === undefined || first < 20 || last > pic.height - 20) return undefined; // prettier-ignore
+	return [pic.width / 2, (first + last + 1) / 2];
+}
+
+/** Tests bare square centers supported on all four sides by the detected photograph lattice. */
+function photoCheckered(
+	pic: Picture,
+	shades: Float32Array,
+	h: Homography,
+	centers: Point[],
+): boolean {
+	let even = 0;
+	let odd = 0;
+	for (const [column, row] of centers) {
+		const [x, y] = project(h, column, row);
+		const shade = shades[Math.floor(y) * pic.width + Math.floor(x)]!;
+		if (!Number.isFinite(shade) || (shade > 0.35 && shade < 0.65)) continue;
+		const expected = (((Math.floor(column) + Math.floor(row)) % 2) + 2) % 2 === 0;
+		if (shade < 0.5 === expected) even++;
+		else odd++;
+	}
+	return even + odd >= Math.max(6, centers.length * 0.25) && Math.max(even, odd) >= CHECKERED_AGREEMENT * (even + odd); // prettier-ignore
 }
 
 /**
@@ -171,7 +216,13 @@ function flatView(grid: Grid): View {
  * The view of a board seen at an angle: every readable square connected to the middle of its lattice.
  * @throws If none is large enough to read.
  */
-function perspectiveView(pic: Picture, toImage: Homography): View {
+function perspectiveView(
+	pic: Picture,
+	toImage: Homography,
+	photographed = false,
+	center?: Point,
+	corners?: Point[],
+): View {
 	const toBoard = invert(toImage);
 	const squares: Square[] = [];
 	const seen = new Set<string>();
@@ -194,9 +245,110 @@ function perspectiveView(pic: Picture, toImage: Homography): View {
 		}
 	}
 	if (squares.length === 0) throw tooSmall();
-	const piecesToImage = raise(toImage, pic.width, pic.height, PIECE_RISE);
+	const piecesToImage = photographed ? toImage : raise(toImage, pic.width, pic.height, PIECE_RISE, center); // prettier-ignore
 	const pieces = { toImage: piecesToImage, toBoard: invert(piecesToImage) };
-	return { toImage, toBoard, pieces, squares, perspective: true };
+	const cornerSupport = corners && (photographed || center) ? supportedCorners(toBoard, corners, pic, toImage, squares, photographed) : undefined; // prettier-ignore
+	return { toImage, toBoard, pieces, squares, perspective: true, cornerSupport, ...(center ? { embedded: true as const } : {}) }; // prettier-ignore
+}
+
+/** Detected intersections, supplemented by local contrast where photographic lighting hides them. */
+function supportedCorners(
+	toBoard: Homography,
+	corners: Point[],
+	pic?: Picture,
+	toImage?: Homography,
+	squares?: Square[],
+	photographed = false,
+): ReadonlySet<string> {
+	const supported = new Set<string>();
+	for (const corner of corners) {
+		const [column, row] = project(toBoard, ...corner);
+		const [c, r] = [Math.round(column), Math.round(row)];
+		if (Math.abs(column - c) < 0.18 && Math.abs(row - r) < 0.18) supported.add(`${c},${r}`); // prettier-ignore
+	}
+	if (pic && toImage && squares) {
+		const checked = new Set<string>();
+		for (const { column, row } of squares) {
+			for (const [c, r] of [
+				[column, row],
+				[column + 1, row],
+				[column, row + 1],
+				[column + 1, row + 1],
+			]) {
+				const key = `${c},${r}`;
+				if (supported.has(key) || checked.has(key)) continue;
+				checked.add(key);
+				if (localCheckerCorner(pic, toImage, c!, r!, photographed)) supported.add(key);
+			}
+		}
+		// Fill small interior gaps from a snapshot, without growing one-sided viewport edges.
+		for (let pass = 0; pass < 2; pass++) {
+			const inferred: string[] = [];
+			for (const key of checked) {
+				if (supported.has(key)) continue;
+				const [c, r] = key.split(',').map(Number) as Point;
+				const near = [
+					[c + 1, r],
+					[c - 1, r],
+					[c, r + 1],
+					[c, r - 1],
+				];
+				if (near.filter(([x, y]) => supported.has(`${x},${y}`)).length >= 3) inferred.push(key); // prettier-ignore
+			}
+			for (const key of inferred) supported.add(key);
+		}
+		if (photographed) {
+			const inferred: string[] = [];
+			for (const key of checked) {
+				if (supported.has(key)) continue;
+				const [c, r] = key.split(',').map(Number) as Point;
+				let neighbors = 0;
+				for (let dy = -1; dy <= 1; dy++) {
+					for (let dx = -1; dx <= 1; dx++) {
+						if ((dx || dy) && supported.has(`${c + dx},${r + dy}`)) neighbors++;
+					}
+				}
+				if (neighbors >= 5) inferred.push(key);
+			}
+			for (const key of inferred) supported.add(key);
+		}
+	}
+	return supported;
+}
+
+/** Local quadrant colors find intersections in bright or shadowed areas outside the global palette. */
+function localCheckerCorner(
+	pic: Picture,
+	toImage: Homography,
+	column: number,
+	row: number,
+	photographed: boolean,
+): boolean {
+	const mean = (c: number, r: number, radius: number): [number, number, number] | undefined => {
+		const [px, py] = project(toImage, c, r);
+		const [x, y] = [Math.floor(px), Math.floor(py)];
+		if (x < radius || y < radius || x >= pic.width - radius || y >= pic.height - radius) return undefined; // prettier-ignore
+		const stride = (pic.width + 1) * 3;
+		const side = 2 * radius + 1;
+		const a = (y - radius) * stride + (x - radius) * 3;
+		const b = a + side * 3;
+		const c0 = a + side * stride;
+		const d = c0 + side * 3;
+		return [0, 1, 2].map((channel) => (pic.sat[d + channel]! - pic.sat[b + channel]! - pic.sat[c0 + channel]! + pic.sat[a + channel]!) / (side * side)) as [number, number, number]; // prettier-ignore
+	};
+	for (const radius of photographed ? [2, 3] : [0, 1]) {
+		for (const reach of photographed ? [0.08, 0.12, 0.2] : [0.18, 0.28]) {
+			const a = mean(column - reach, row - reach, radius);
+			const b = mean(column + reach, row - reach, radius);
+			const c = mean(column + reach, row + reach, radius);
+			const d = mean(column - reach, row + reach, radius);
+			if (!a || !b || !c || !d) continue;
+			const variation = Math.max(colorDistance(a, c), colorDistance(b, d));
+			const contrast = Math.min(colorDistance(a, b), colorDistance(c, d));
+			if (variation < 0.1 && contrast > Math.max(0.1, 2 * variation)) return true;
+		}
+	}
+	return false;
 }
 
 /** A square, if it's fully on screen and large enough to read. */

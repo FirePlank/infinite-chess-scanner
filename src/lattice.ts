@@ -41,7 +41,7 @@ const SEED_NEIGHBORHOOD = 120;
 const CELL_SIZE = 16;
 
 /** How far down the screen an axis must point to be one the pieces might stand along, as a cosine. */
-const MIN_DOWNWARDNESS = 0.05;
+const MIN_DOWNWARDNESS = 0.005;
 
 /** How much the lattice grows before its homography is refitted to predict further corners. */
 const REFIT_GROWTH = 1.1;
@@ -67,17 +67,57 @@ const RING_VALUES = new Int8Array(RING_POINTS);
  * each point matching the one opposite it. Unlike reading along the image axes, this works at any
  * rotation and slant.
  */
-export function findCorners(pic: Picture, classes: Int8Array): Point[] {
+export function findCorners(pic: Picture, classes: Int8Array, shades?: Float32Array): Point[] {
 	const { width, height } = pic;
-	const ring = ringOffsets(width);
+	const radius = shades ? 7 : RING_RADIUS;
+	const ring = ringOffsets(width, radius);
 	const hits = new Uint8Array(width * height);
 	const values = new Int8Array(RING_POINTS);
-	for (let y = RING_RADIUS; y < height - RING_RADIUS; y++) {
-		for (let x = RING_RADIUS; x < width - RING_RADIUS; x++) {
-			if (isCornerAt(classes, y * width + x, ring, values)) hits[y * width + x] = 1;
+	for (let y = radius; y < height - radius; y++) {
+		for (let x = radius; x < width - radius; x++) {
+			const at = y * width + x;
+			if (!isCornerAt(classes, at, ring, values)) continue;
+			if (shades) {
+				let low = Infinity;
+				let high = -Infinity;
+				for (const offset of ring) {
+					low = Math.min(low, shades[at + offset]!);
+					high = Math.max(high, shades[at + offset]!);
+				}
+				if (high - low < 0.6) continue;
+			}
+			hits[at] = 1;
 		}
 	}
-	return clusterCenters(hits, width);
+	const corners = clusterCenters(hits, width, shades ? 8 : 1);
+	return shades ? corners.map((corner) => refineCorner(corner, shades, width)) : corners;
+}
+
+/** The saddle of a local quadratic locates the crossing beneath display stripes and blur. */
+function refineCorner(corner: Point, shades: Float32Array, width: number): Point {
+	const [cx, cy] = corner.map(Math.floor) as Point;
+	let bx = 0;
+	let by = 0;
+	let xx = 0;
+	let xy = 0;
+	let yy = 0;
+	for (let y = -3; y <= 3; y++) {
+		for (let x = -3; x <= 3; x++) {
+			const value = shades[(cy + y) * width + cx + x]!;
+			if (!Number.isFinite(value)) return corner;
+			bx += value * x;
+			by += value * y;
+			xx += value * (x * x - 4);
+			xy += value * x * y;
+			yy += value * (y * y - 4);
+		}
+	}
+	[bx, by, xx, xy, yy] = [bx / 196, by / 196, xx / 588, xy / 784, yy / 588];
+	const determinant = 4 * xx * yy - xy * xy;
+	if (!(determinant < -1e-6)) return corner;
+	const x = (xy * by - 2 * yy * bx) / determinant;
+	const y = (xy * bx - 2 * xx * by) / determinant;
+	return Math.hypot(x, y) < 3 ? [cx + 0.5 + x, cy + 0.5 + y] : corner;
 }
 
 /** Whether a checkerboard corner shows within a pixel of a point. */
@@ -104,14 +144,15 @@ export function tileClasses(shades: Float32Array): Int8Array {
 }
 
 /** The offsets of the ring's pixels around a pixel, as index steps in an image of a width. Kept per width. */
-function ringOffsets(width: number): Int32Array {
-	const kept = RINGS.get(width);
+function ringOffsets(width: number, radius = RING_RADIUS): Int32Array {
+	const key = width * 16 + radius;
+	const kept = RINGS.get(key);
 	if (kept) return kept;
 	const ring = new Int32Array(RING_POINTS);
-	RINGS.set(width, ring);
+	RINGS.set(key, ring);
 	for (let k = 0; k < RING_POINTS; k++) {
 		const angle = (2 * Math.PI * k) / RING_POINTS;
-		ring[k] = Math.round(RING_RADIUS * Math.sin(angle)) * width + Math.round(RING_RADIUS * Math.cos(angle)); // prettier-ignore
+		ring[k] = Math.round(radius * Math.sin(angle)) * width + Math.round(radius * Math.cos(angle)); // prettier-ignore
 	}
 	return ring;
 }
@@ -142,7 +183,7 @@ function isCornerAt(classes: Int8Array, at: number, ring: Int32Array, values: In
 }
 
 /** The centers of each 8-connected cluster of hits, at pixel centers. */
-function clusterCenters(hits: Uint8Array, width: number): Point[] {
+function clusterCenters(hits: Uint8Array, width: number, minPixels = 1): Point[] {
 	const centers: Point[] = [];
 	const seen = new Uint8Array(hits.length);
 	for (let start = 0; start < hits.length; start++) {
@@ -167,7 +208,7 @@ function clusterCenters(hits: Uint8Array, width: number): Point[] {
 				}
 			}
 		}
-		centers.push([sumX / n + 0.5, sumY / n + 0.5]);
+		if (n >= minPixels) centers.push([sumX / n + 0.5, sumY / n + 0.5]);
 	}
 	return centers;
 }
@@ -184,10 +225,12 @@ export function fitLattice(
 	corners: Point[],
 	width: number,
 	height: number,
+	photographed = false,
+	check?: (h: Homography, centers: Point[]) => boolean,
 ): Homography[] | undefined {
-	const lattice = growLattice(corners, width, height);
+	const lattice = growLattice(corners, width, height, photographed, check);
 	if (lattice === undefined) return undefined;
-	const h = fitRobustly(lattice);
+	const h = fitRobustly(lattice, photographed ? 3 : OUTLIER_DISTANCE);
 	if (h === undefined) return undefined;
 	return orientations(h).map((relabeling) => compose(h, relabeling));
 }
@@ -200,17 +243,34 @@ function growLattice(
 	corners: Point[],
 	width: number,
 	height: number,
+	photographed: boolean,
+	check?: (h: Homography, centers: Point[]) => boolean,
 ): Map<LatticeKey, Point> | undefined {
 	const index = new CornerIndex(corners);
 	const middle: Point = [width / 2, height / 2];
 	// Seeds spread outward from the middle, as stray corners cluster where pieces stand.
 	const byDistance = [...corners].sort((a, b) => distance(a, middle) - distance(b, middle));
-	const stride = Math.max(1, Math.floor(corners.length / (4 * SEED_ATTEMPTS)));
-	const seeds = byDistance.filter((_, i) => i % stride === 0).slice(0, SEED_ATTEMPTS);
+	const attempts = photographed ? 40 : SEED_ATTEMPTS;
+	const stride = Math.max(1, Math.floor(corners.length / (4 * attempts)));
+	const seeds = byDistance.filter((_, i) => i % stride === 0).slice(0, attempts);
 	let best: Map<LatticeKey, Point> | undefined;
 	for (const seed of seeds) {
-		const lattice = growFrom(seed, index, width, height);
-		if (lattice && lattice.size > (best?.size ?? 0)) best = lattice;
+		const initial = photographed ? photoSeeds(seed, index) : [seedLattice(seed, index)];
+		for (const candidate of initial) {
+			if (!candidate) continue;
+			const lattice = growFrom(candidate, index, width, height);
+			if (!lattice || lattice.size <= (best?.size ?? 0)) continue;
+			if (check) {
+				const h = fitRobustly(lattice, 3);
+				const centers: Point[] = [];
+				for (const key of lattice.keys()) {
+					const [column, row] = key.split(',').map(Number) as Point;
+					if (lattice.has(`${column + 1},${row}`) && lattice.has(`${column},${row + 1}`) && lattice.has(`${column + 1},${row + 1}`)) centers.push([column + 0.5, row + 0.5]); // prettier-ignore
+				}
+				if (!h || !check(h, centers)) continue;
+			}
+			best = lattice;
+		}
 		if (best && (best.size >= ENOUGH_LATTICE_CORNERS || best.size > corners.length / 2)) break;
 	}
 	return best && best.size >= MIN_LATTICE_CORNERS ? best : undefined;
@@ -218,18 +278,20 @@ function growLattice(
 
 /** Grows the lattice out from one corner, ring by ring, predicting each corner by the homography fitted so far. */
 function growFrom(
-	seed: Point,
+	lattice: Map<LatticeKey, Point>,
 	index: CornerIndex,
 	width: number,
 	height: number,
 ): Map<LatticeKey, Point> | undefined {
-	const lattice = seedLattice(seed, index);
-	if (lattice === undefined) return undefined;
 	const used = new Set(lattice.values());
 	let h = fitHomography(pairsOf(lattice));
 	let fitted = lattice.size;
 	// Rings that add nothing are tolerated a few times, as a row of pieces can hide a ring's corners.
-	for (let radius = 2, emptyRings = 0; emptyRings < 3; radius++) {
+	for (
+		let radius = 2, emptyRings = 0;
+		emptyRings < 3 && radius <= Math.max(width, height) / 6;
+		radius++
+	) {
 		let added = 0;
 		for (let column = -radius; column <= radius; column++) {
 			for (let row = -radius; row <= radius; row++) {
@@ -249,6 +311,27 @@ function growFrom(
 		}
 	}
 	return lattice;
+}
+
+/** Several nearby crosses, clearing small marks and pieces that can obscure the nearest corner. */
+function photoSeeds(seed: Point, index: CornerIndex): Map<LatticeKey, Point>[] {
+	const nearby = index.near(seed, SEED_NEIGHBORHOOD).filter((p) => distance(p, seed) > 20);
+	nearby.sort((a, b) => distance(a, seed) - distance(b, seed));
+	const seeds: Map<LatticeKey, Point>[] = [];
+	for (const first of nearby.slice(0, 8)) {
+		const spacing = distance(seed, first);
+		const oppositeFirst = index.nearest([2 * seed[0] - first[0], 2 * seed[1] - first[1]], 0.2 * spacing); // prettier-ignore
+		if (!oppositeFirst) continue;
+		for (const second of nearby.slice(0, 12)) {
+			const otherSpacing = distance(seed, second);
+			if (otherSpacing < spacing * 0.5 || otherSpacing > spacing * 2 || angleBetween(first, second, seed) < Math.PI / 5) continue; // prettier-ignore
+			const oppositeSecond = index.nearest([2 * seed[0] - second[0], 2 * seed[1] - second[1]], 0.2 * otherSpacing); // prettier-ignore
+			const diagonal = index.nearest([first[0] + second[0] - seed[0], first[1] + second[1] - seed[1]], 0.2 * Math.min(spacing, otherSpacing)); // prettier-ignore
+			if (!oppositeSecond || !diagonal) continue;
+			seeds.push(new Map<LatticeKey, Point>([['0,0', seed], ['1,0', first], ['0,1', second], ['-1,0', oppositeFirst], ['0,-1', oppositeSecond], ['1,1', diagonal]])); // prettier-ignore
+		}
+	}
+	return seeds;
 }
 
 /**
@@ -296,13 +379,11 @@ function snap(
 }
 
 /** Fits the lattice's homography, refitting without the corners that disagree with it. */
-function fitRobustly(lattice: Map<LatticeKey, Point>): Homography | undefined {
+function fitRobustly(lattice: Map<LatticeKey, Point>, tolerance: number): Homography | undefined {
 	let pairs = pairsOf(lattice);
 	let h = fitHomography(pairs);
 	for (let round = 0; round < 3; round++) {
-		pairs = pairs.filter(
-			([at, corner]) => distance(project(h, ...at), corner) < OUTLIER_DISTANCE,
-		);
+		pairs = pairs.filter(([at, corner]) => distance(project(h, ...at), corner) < tolerance);
 		if (pairs.length < MIN_LATTICE_CORNERS) return undefined;
 		h = fitHomography(pairs);
 	}
