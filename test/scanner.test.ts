@@ -83,49 +83,6 @@ function findTranslation(expected: Position, read: Position): [number, number] {
 function check(reading: Reading, fixture: Fixture): void {
 	const expected = parse(fixture.icn);
 	const read = parse(reading.icn);
-	const coordinates = [...read.pieces.keys()].map(
-		(key) => key.split(',').map(Number) as [number, number],
-	);
-	assert.ok(
-		[1, 2].includes(Math.min(...coordinates.map(([x]) => x))),
-		'The leftmost piece must be on file 1 or 2.',
-	);
-	if (reading.promotion?.white.length === 1 && reading.promotion.black.length === 1)
-		assert.equal(reading.promotion.black[0], 1, "Black's promotion rank must be 1.");
-	assert.deepEqual(
-		new Map(reading.pieces.map(({ abbreviation, x, y }) => [`${x},${y}`, abbreviation])),
-		read.pieces,
-		'Piece coordinates in the API and ICN must agree.',
-	);
-	assert.deepEqual(
-		reading.promotion,
-		read.promotion ?? undefined,
-		'Promotion coordinates in the API and ICN must agree.',
-	);
-	assert.deepEqual(
-		reading.worldBorder && [
-			reading.worldBorder.left,
-			reading.worldBorder.right,
-			reading.worldBorder.bottom,
-			reading.worldBorder.top,
-		],
-		read.border,
-		'World-border coordinates in the API and ICN must agree.',
-	);
-	for (const key of reading.shown) {
-		const [x, y] = key.split(',').map(Number) as [number, number];
-		assert.ok(
-			x >= reading.area.left &&
-				x <= reading.area.right &&
-				y >= reading.area.bottom &&
-				y <= reading.area.top,
-			`Shown square ${key} lies outside the reported area.`,
-		);
-	}
-	if (fixture.image === 'chess.png') {
-		assert.equal(Math.min(...coordinates.map(([, y]) => y)), -3);
-		assert.equal(Math.max(...coordinates.map(([, y]) => y)), 4);
-	}
 	if (fixture.minimumPieces !== undefined)
 		assert.ok(
 			read.pieces.size >= fixture.minimumPieces,

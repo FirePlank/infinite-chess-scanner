@@ -5,7 +5,7 @@
 
 import type { RGB } from './color.js';
 import type { Picture } from './picture.js';
-import type { PlacedPiece, Promotion, WorldBorder } from './icn.js';
+import type { Promotion, WorldBorder } from './icn.js';
 import type { SampledSquare } from './matcher.js';
 import type { Tiles } from './tiles.js';
 import type { Square, View } from './view.js';
@@ -26,7 +26,8 @@ export interface Extent {
 }
 
 /**
- * Maps square columns and rows to board coordinates, with an even x+y on dark squares.
+ * Maps square columns and rows to board coordinates: the middle square read is 0,0, shifted a
+ * file if needed so that dark squares have an even x+y.
  */
 export interface Frame {
 	midX: number;
@@ -55,23 +56,6 @@ export function frameOf(squares: Square[], darkParity: number, flipped: boolean)
 	const midX = extent.left + Math.floor((extent.right - extent.left + 1) / 2);
 	const midY = extent.top + Math.floor((extent.bottom - extent.top + 1) / 2);
 	return { midX, midY, shift: parity(midX + midY) === darkParity ? 0 : 1, flipped };
-}
-
-/**
- * Anchors a read position at positive files and, with one promotion rank per side, Black's rank
- * at y=1. The leftmost piece sits at x=1 or x=2 so the translation preserves square colors.
- */
-export function anchorFrame(
-	frame: Frame,
-	pieces: PlacedPiece[],
-	promotion: Promotion | undefined,
-): Frame {
-	const dy =
-		promotion?.white.length === 1 && promotion.black.length === 1 ? 1 - promotion.black[0]! : 0;
-	let dx = pieces.length > 0 ? 1 - Math.min(...pieces.map((piece) => piece.x)) : 0;
-	dx += parity(dx + dy);
-	const direction = frame.flipped ? -1 : 1;
-	return { ...frame, midX: frame.midX - direction * dx, midY: frame.midY + direction * dy };
 }
 
 /** The board x of a square column. */

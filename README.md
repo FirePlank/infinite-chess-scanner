@@ -64,12 +64,12 @@ import { readScreenshot } from 'infinite-chess-scanner';
 const reading = await readScreenshot('screenshot.png'); // A file path or a Buffer
 // await readScreenshot('screenshot.png', { perspective: 'black' });
 
-reading.icn; //         'w 1 (8|1) r1,8|n2,8|b3,8|...'
-reading.pieces; //      [{ abbreviation: 'r', x: 1, y: 8 }, ...]
-reading.promotion; //   { white: [8], black: [1] }, or undefined
+reading.icn; //         'w 1 (4|-3) r-3,4|n-2,4|b-1,4|...'
+reading.pieces; //      [{ abbreviation: 'r', x: -3, y: 4 }, ...]
+reading.promotion; //   { white: [4], black: [-3] }, or undefined
 reading.worldBorder; // { left, right, bottom, top }, null on open sides, or undefined
-reading.shown; //       Set { '-10,12', ... }, every fully visible board square read
-reading.area; //        { left: -10, right: 19, bottom: -3, top: 12 }, bounding box including border exterior
+reading.shown; //       Set { '-14,8', ... }, every fully visible board square read
+reading.area; //        { left: -14, right: 15, bottom: -7, top: 8 }, bounding box including border exterior
 reading.squareSize; //  50.53, in pixels, of the largest square
 reading.perspective; // false, or true when the board is seen at an angle
 ```
@@ -83,23 +83,22 @@ Install it into another project with `npm install github:FirePlank/infinite-ches
 <img src="test/fixtures/classical.png" alt="Classical starting position" width="800" />
 
 ```
-w 1 (8|1) r1,8|n2,8|b3,8|q4,8|k5,8|b6,8|n7,8|r8,8|p1,7|p2,7|p3,7|p4,7|p5,7|p6,7|p7,7|p8,7|P1,2|P2,2|P3,2|P4,2|P5,2|P6,2|P7,2|P8,2|R1,1|N2,1|B3,1|Q4,1|K5,1|B6,1|N7,1|R8,1
+w 1 (4|-3) r-3,4|n-2,4|b-1,4|q0,4|k1,4|b2,4|n3,4|r4,4|p-3,3|p-2,3|p-1,3|p0,3|p1,3|p2,3|p3,3|p4,3|P-3,-2|P-2,-2|P-1,-2|P0,-2|P1,-2|P2,-2|P3,-2|P4,-2|R-3,-3|N-2,-3|B-1,-3|Q0,-3|K1,-3|B2,-3|N3,-3|R4,-3
 ```
 
-A screenshot can't reveal the board's original coordinates. The scanner places the leftmost piece on
-file 1 or 2, choosing the shift that preserves the colors of its squares. When exactly one promotion
-rank is read for each side, Black's rank becomes Y=1. Here the white king lands on `5,1`, with every
-piece in the right place relative to the others.
+A screenshot can't tell where on the infinite board it is, so the middle square of the visible board
+region's bounding box becomes 0,0. Here that puts the white king on `1,-3` rather than `5,1`, with
+every piece in the right place relative to the others.
 
 ### Royals in Check
 
 <img src="test/fixtures/wood-check.png" alt="A crowded fairy position with royal queens in check" width="800" />
 
 ```
-w 1 (8|1) ze53,21|ze54,21|nr33,20|ze56,20|ha14,19|ha15,19|nr31,19|HU37,19|nr43,19|ze59,19|ze62,19|ze64,19|ha15,18|HU39,18|nr43,18|nr44,18|CA6,17|ha16,17|ha17,17|nr22,17|nr27,17|nr28,17|ar36,17|HU39,17|nr48,17|CA4,16|CA5,16|CA6,16|CA8,16|GI20,16|ar31,16|ar32,16|nr48,16|nr49,16|nr50,16|nr53,16|nr54,16|CA3,15|hu24,15|vo61,15|CA10,14|R16,14|GI19,14|ar27,14|RQ41,14|ZE57,14|vo62,14|vo63,14|GI19,13|HA38,13|vo44,13|ob51,13|ZE57,13|vo64,13|vo65,13|ce12,12|GI17,12|R21,12|HA33,12|ob51,12|vo65,12|NR4,11|ca10,11|rq22,11|p35,11|p36,11|p37,11|p38,11|ZE42,11|gi48,11|am14,10|rq20,10|ar25,10|p26,10|p28,10|p45,10|p47,10|ro55,10|ro56,10|rq19,9|p27,9|p46,9|ro56,9|ro57,9|ca7,8|am11,8|ce17,8|RQ27,8|r33,8|n34,8|b35,8|q36,8|k37,8|b38,8|n39,8|r40,8|gi48,8|ob52,8|HA63,8|ca7,7|ar21,7|HA22,7|HA30,7|n32,7|p33,7|p34,7|p35,7|p36,7|p37,7|p38,7|p39,7|p40,7|n41,7|gi48,7|HA63,7|HA64,7|NR4,6|ca7,6|CA15,6|gi48,6|ha58,6|vo68,6|ca6,5|ob10,5|ob11,5|HA26,5|HA27,5|gu34,5|gu35,5|gu37,5|gu46,5|gu50,5|vo68,5|ob10,4|CA15,4|ar18,4|HA23,4|gu31,4|gu50,4|gu53,4|ha58,4|HA64,4|vo68,4|ar2,3|ob9,3|ce20,3|HA64,3|ar4,2|ob8,2|vo12,2|CA15,2|CA16,2|ce20,2|ce23,2|ce27,2|N32,2|P33,2|P34,2|P35,2|P36,2|P37,2|P38,2|P39,2|P40,2|N41,2|HA64,2|ob8,1|vo12,1|CA16,1|R33,1|N34,1|B35,1|Q36,1|K37,1|B38,1|N39,1|R40,1|ha55,1|HA64,1|ob8,0|vo12,0|RQ20,0|RQ21,0|ce27,0|P46,0|NR4,-1|ob7,-1|RO9,-1|vo13,-1|RQ21,-1|P26,-1|P28,-1|P45,-1|P47,-1|ha52,-1|ob7,-2|vo13,-2|HA19,-2|GU31,-2|P35,-2|P36,-2|P37,-2|P38,-2|nr46,-2|ob7,-3|RO10,-3|vo13,-3|HA19,-3|am42,-3|p56,-3|p57,-3|RO2,-4|ob7,-4|vo13,-4|vo14,-4|HA19,-4|HA20,-4|ob23,-4|GU27,-4|ob50,-4|vo14,-5|vo15,-5|vo16,-5|gu22,-5|ce36,-5|nr47,-5|p58,-5|ce31,-6|GU44,-6|nr47,-6|nr51,-6|nr54,-6|NR5,-7|NR20,-7|ob41,-7|p60,-7|RO3,-8|NR8,-8|CA12,-8|CA16,-8|CA18,-8|gu24,-8|RO27,-8|ob38,-8|ob39,-8|RO27,-9|GU45,-9|p62,-9|CA20,-10|GU48,-10|GU52,-10|p63,-10|p64,-10|NR11,-11|NR14,-11|NR15,-11|gu24,-11|RO31,-12|RO38,-12|RO39,-12
+w 1 (4|-3) ze17,17|ze18,17|nr-3,16|ze20,16|ha-22,15|ha-21,15|nr-5,15|HU1,15|nr7,15|ze23,15|ze26,15|ze28,15|ha-21,14|HU3,14|nr7,14|nr8,14|CA-30,13|ha-20,13|ha-19,13|nr-14,13|nr-9,13|nr-8,13|ar0,13|HU3,13|nr12,13|CA-32,12|CA-31,12|CA-30,12|CA-28,12|GI-16,12|ar-5,12|ar-4,12|nr12,12|nr13,12|nr14,12|nr17,12|nr18,12|CA-33,11|hu-12,11|vo25,11|CA-26,10|R-20,10|GI-17,10|ar-9,10|RQ5,10|ZE21,10|vo26,10|vo27,10|GI-17,9|HA2,9|vo8,9|ob15,9|ZE21,9|vo28,9|vo29,9|ce-24,8|GI-19,8|R-15,8|HA-3,8|ob15,8|vo29,8|NR-32,7|ca-26,7|rq-14,7|p-1,7|p0,7|p1,7|p2,7|ZE6,7|gi12,7|am-22,6|rq-16,6|ar-11,6|p-10,6|p-8,6|p9,6|p11,6|ro19,6|ro20,6|rq-17,5|p-9,5|p10,5|ro20,5|ro21,5|ca-29,4|am-25,4|ce-19,4|RQ-9,4|r-3,4|n-2,4|b-1,4|q0,4|k1,4|b2,4|n3,4|r4,4|gi12,4|ob16,4|HA27,4|ca-29,3|ar-15,3|HA-14,3|HA-6,3|n-4,3|p-3,3|p-2,3|p-1,3|p0,3|p1,3|p2,3|p3,3|p4,3|n5,3|gi12,3|HA27,3|HA28,3|NR-32,2|ca-29,2|CA-21,2|gi12,2|ha22,2|vo32,2|ca-30,1|ob-26,1|ob-25,1|HA-10,1|HA-9,1|gu-2,1|gu-1,1|gu1,1|gu10,1|gu14,1|vo32,1|ob-26,0|CA-21,0|ar-18,0|HA-13,0|gu-5,0|gu14,0|gu17,0|ha22,0|HA28,0|vo32,0|ar-34,-1|ob-27,-1|ce-16,-1|HA28,-1|ar-32,-2|ob-28,-2|vo-24,-2|CA-21,-2|CA-20,-2|ce-16,-2|ce-13,-2|ce-9,-2|N-4,-2|P-3,-2|P-2,-2|P-1,-2|P0,-2|P1,-2|P2,-2|P3,-2|P4,-2|N5,-2|HA28,-2|ob-28,-3|vo-24,-3|CA-20,-3|R-3,-3|N-2,-3|B-1,-3|Q0,-3|K1,-3|B2,-3|N3,-3|R4,-3|ha19,-3|HA28,-3|ob-28,-4|vo-24,-4|RQ-16,-4|RQ-15,-4|ce-9,-4|P10,-4|NR-32,-5|ob-29,-5|RO-27,-5|vo-23,-5|RQ-15,-5|P-10,-5|P-8,-5|P9,-5|P11,-5|ha16,-5|ob-29,-6|vo-23,-6|HA-17,-6|GU-5,-6|P-1,-6|P0,-6|P1,-6|P2,-6|nr10,-6|ob-29,-7|RO-26,-7|vo-23,-7|HA-17,-7|am6,-7|p20,-7|p21,-7|RO-34,-8|ob-29,-8|vo-23,-8|vo-22,-8|HA-17,-8|HA-16,-8|ob-13,-8|GU-9,-8|ob14,-8|vo-22,-9|vo-21,-9|vo-20,-9|gu-14,-9|ce0,-9|nr11,-9|p22,-9|ce-5,-10|GU8,-10|nr11,-10|nr15,-10|nr18,-10|NR-31,-11|NR-16,-11|ob5,-11|p24,-11|RO-33,-12|NR-28,-12|CA-24,-12|CA-20,-12|CA-18,-12|gu-12,-12|RO-9,-12|ob2,-12|ob3,-12|RO-9,-13|GU9,-13|p26,-13|CA-16,-14|GU12,-14|GU16,-14|p27,-14|p28,-14|NR-25,-15|NR-22,-15|NR-21,-15|gu-12,-15|RO-5,-16|RO2,-16|RO3,-16
 ```
 
-The royal queens glowing red come out as `RQ` and `rq`, while the white queen on `36,1` stays a
+The royal queens glowing red come out as `RQ` and `rq`, while the white queen on `0,-3` stays a
 plain `Q`.
 
 ### World Border
@@ -107,23 +106,21 @@ plain `Q`.
 <img src="test/fixtures/chess.png" alt="Chess on a bordered 8x8 board" width="800" />
 
 ```
-w 1 1,8,-3,4 r1,4|n2,4|b3,4|q4,4|k5,4|b6,4|n7,4|r8,4|p1,3|p2,3|p3,3|p4,3|p5,3|p6,3|p7,3|p8,3|P1,-2|P2,-2|P3,-2|P4,-2|P5,-2|P6,-2|P7,-2|P8,-2|R1,-3|N2,-3|B3,-3|Q4,-3|K5,-3|B6,-3|N7,-3|R8,-3
+w 1 -3,4,-3,4 r-3,4|n-2,4|b-1,4|q0,4|k1,4|b2,4|n3,4|r4,4|p-3,3|p-2,3|p-1,3|p0,3|p1,3|p2,3|p3,3|p4,3|P-3,-2|P-2,-2|P-1,-2|P0,-2|P1,-2|P2,-2|P3,-2|P4,-2|R-3,-3|N-2,-3|B-1,-3|Q0,-3|K1,-3|B2,-3|N3,-3|R4,-3
 ```
 
-The board ends inside the screenshot on every side, so the world border `1,8,-3,4` is read too. No
-promotion pair is detected here, so Y stays relative to the visible board's center.
+The board ends inside the screenshot on every side, so the world border `-3,4,-3,4` is read too.
 
 ### Perspective
 
 <img src="test/fixtures/persp-abundance-graze.png" alt="Abundance seen at a grazing angle in perspective mode" width="800" />
 
 ```
-w 1 (13|1) p4,17|ha5,17|ha6,17|r7,17|ha8,17|ha9,17|p10,17|p5,16|p6,16|p8,16|p9,16|p2,13|gu3,13|r4,13|b5,13|b6,13|k7,13|b8,13|b9,13|r10,13|gu11,13|p12,13|p3,12|gu4,12|n6,12|q7,12|n8,12|gu10,12|p11,12|p4,11|p5,11|gu6,11|ch7,11|gu8,11|p9,11|p10,11|p6,10|p7,10|p8,10|P6,4|P7,4|P8,4|P4,3|P5,3|GU6,3|CH7,3|GU8,3|P9,3|P10,3|P3,2|GU4,2|N6,2|Q7,2|N8,2|GU10,2|P11,2|P2,1|GU3,1|R4,1|B5,1|B6,1|K7,1|B8,1|B9,1|R10,1|GU11,1|P12,1|P5,-2|P6,-2|P8,-2|P9,-2|P4,-3|HA5,-3|HA6,-3|R7,-3|HA8,-3|HA9,-3|P10,-3
+w 1 (-6|-18) p-21,-2|ha-20,-2|ha-19,-2|r-18,-2|ha-17,-2|ha-16,-2|p-15,-2|p-20,-3|p-19,-3|p-17,-3|p-16,-3|p-23,-6|gu-22,-6|r-21,-6|b-20,-6|b-19,-6|k-18,-6|b-17,-6|b-16,-6|r-15,-6|gu-14,-6|p-13,-6|p-22,-7|gu-21,-7|n-19,-7|q-18,-7|n-17,-7|gu-15,-7|p-14,-7|p-21,-8|p-20,-8|gu-19,-8|ch-18,-8|gu-17,-8|p-16,-8|p-15,-8|p-19,-9|p-18,-9|p-17,-9|P-19,-15|P-18,-15|P-17,-15|P-21,-16|P-20,-16|GU-19,-16|CH-18,-16|GU-17,-16|P-16,-16|P-15,-16|P-22,-17|GU-21,-17|N-19,-17|Q-18,-17|N-17,-17|GU-15,-17|P-14,-17|P-23,-18|GU-22,-18|R-21,-18|B-20,-18|B-19,-18|K-18,-18|B-17,-18|B-16,-18|R-15,-18|GU-14,-18|P-13,-18|P-20,-21|P-19,-21|P-17,-21|P-16,-21|P-21,-22|HA-20,-22|HA-19,-22|R-18,-22|HA-17,-22|HA-16,-22|P-15,-22
 ```
 
 All 78 pieces of Abundance and both promotion lines, read at a grazing angle with the board turned
-sideways, the farthest on squares about 15 pixels across. Black's promotion rank stays at Y=1 even
-though some pieces extend below it.
+sideways, the farthest on squares about 15 pixels across.
 
 ## Taking a Screenshot or Photo
 
@@ -135,12 +132,9 @@ though some pieces extend below it.
 
 ## Limitations
 
-- **Coordinate anchors**: every piece has X≥1; the leftmost piece is on file 1 or 2, preserving even
-  x+y on dark squares. Exactly one detected promotion rank per side anchors Black's rank at Y=1,
-  even when pieces extend below it. Otherwise Y stays relative to the visible board's center. These
-  shifts also apply to promotion ranks, world borders, `reading.shown` and `reading.area`; empty
-  squares can still have negative coordinates. Original board coordinates can't be known from the
-  image, but the pieces' positions relative to each other are preserved.
+- **Relative coordinates**: the middle square of the visible board region's bounding box becomes
+  0,0, nudged so that dark squares have an even x+y as on the site. Exact board coordinates can't be
+  known from the image; the pieces' positions relative to each other are preserved.
 - **Hidden state**: special rights, whose turn it is, the move rule and clocks don't show on the
   board. The ICN says white to move on move 1, with no special rights.
 - **Promotion**: read only when both sides' lines show, with the upper half of the lines taken as
