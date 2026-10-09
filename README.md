@@ -7,12 +7,12 @@ board and writes it as ICN, ready to paste back into the site.
 
 ## Features
 
-- **Theme and zoom detection**: finds the square grid from the board's own tiles, to a fraction of a
-  pixel on clear screenshots. No calibration, no cropping to exact squares.
-- **Perspective mode**: reads boards seen at an angle too, by fitting the board's projection from
-  its checkerboard corners.
-- **Menus, browser windows and photos**: finds the visible board around application bars and
-  foreground objects, including in photos, and leaves recognized covered squares out of the reading.
+- **Any theme, any zoom**: finds the square grid from the board's own tiles, to a fraction of a
+  pixel. No calibration, no cropping to exact squares.
+- **Perspective mode**: reads boards seen at an angle too, at any tilt and turn, by fitting the
+  board's projection from its checkerboard corners.
+- **Menus, browser windows and photos**: finds the board around whatever covers part of it, even in
+  a photo of the screen, and leaves the covered squares out of the reading.
 - **Every piece**: all 21 piece types and voids, for white, black and neutral, plus the red, blue,
   yellow and green players.
 - **Pixel-exact matching**: renders each sprite the way the site's WebGL does, so pieces that differ
@@ -20,8 +20,8 @@ board and writes it as ICN, ready to paste back into the site.
 - **Highlights and checks**: a square's background is fitted rather than assumed, so move highlights
   don't get in the way, and the red glow of a royal in check marks it as royal.
 - **Promotion lines and world borders**: read wherever they show, and written into the ICN.
-- **Fast screenshot path**: clear screenshots avoid camera recovery. Cached sprite templates and
-  background checks reduce repeated fitting, with several images read at once across every core.
+- **Fast**: a few hundred milliseconds a screenshot and a few seconds a photo, with several read at
+  once across every core.
 
 ## Quick Start
 
@@ -74,29 +74,6 @@ reading.perspective; // false, or true when the board is seen at an angle
 ```
 
 Install it into another project with `npm install github:FirePlank/infinite-chess-scanner`.
-
-## How It Works
-
-Clear screenshots use the regular tile grid and the site's exact sprite rendering, including its
-texture filtering and mipmaps. Camera captures use display-noise evidence to select a separate path:
-averaging at several scales recovers tile colors, and local alternating checkerboard corners provide
-grid candidates. A projection must agree with inliers spread across the visible board; an isolated
-cluster of edges or a repeated obstacle pattern is not enough.
-
-Exposed tile perimeters, neighboring checkerboard colors and directly observed corners establish
-which cells show the board. Foreground evidence excludes covered cells, while repeated sky lanes
-identify gaps between separated islands. A bounded hole with weak corner evidence remains only a
-candidate: its held-out interior must contain structure beyond the noise measured independently on
-its perimeter before a glyph can be accepted. Knowing where the grid continues does not reveal what
-is hidden beneath an object.
-
-Each photographic glyph fit allows a bounded local exposure gain and color cast, while fitting the
-background and check glow separately. Bare tiles consistent with their perimeter noise skip the
-expensive glyph search. Shared background measurements, sprite templates and alignment variants are
-cached during a read. Promotion recovery compares RGB row-boundary profiles with local tile blends,
-calibrates their noise against ordinary checkerboard boundaries and nearby strips, and requires
-persistent support across separated cells. Both players' lines must show before ranks are written.
-World borders come from the observed board-to-sky transition.
 
 ## Examples
 
@@ -167,12 +144,10 @@ sideways, the farthest on squares about 15 pixels across.
 - **Squares under 6.5 pixels** are refused rather than guessed. In perspective mode that's measured
   across a square's narrower side, so the far part of the board is left unread, and only the squares
   in `reading.shown` say anything about the position.
-- **Covered squares**: squares recognized as covered by a menu or an object are left out of
-  `reading.shown`; hidden pieces cannot be reconstructed. Small foreground fragments that resemble
-  sprites can remain ambiguous.
-- **Camera geometry and detail**: a single planar projection models the display. Strong lens
-  distortion, a curved screen or local image warping can exceed the tolerated alignment. Blur, glare
-  and compression can erase the details needed to distinguish pieces or promotion lines.
+- **Covered squares**: a square even partly covered by a menu or an object is left out of
+  `reading.shown`, and what's under it isn't guessed.
+- **Photos**: the screen must show flat. Lens distortion, a curved screen, blur, glare or heavy
+  compression can hide what tells pieces apart.
 - **What's drawn over the board**: arrows, annotations and legal move dots aren't understood, and
   can throw off the squares under them. Move highlights are fine.
 - **Black's side** must be asked for with `--black`. Without it, the position reads rotated 180°.
@@ -187,34 +162,16 @@ sideways, the farthest on squares about 15 pixels across.
 npm test
 ```
 
-The [fixture manifest](test/fixtures/fixtures.json) contains 63 screenshots and photos of the site,
-each checked against an independently verified position up to translation: pieces, voids, promotion
-ranks and world border. They cover the 18 standard variants, zoom levels down to 7-pixel squares,
-multiple board themes, royals in check, black's side, perspective mode at several tilts and turns, a
-whole browser window, and photos of the screen with things in front of it. Separated 4D boards test
-every island and the voids between them. Five generated cases lay menus over a screenshot, one in a
-tile color and one over part of a piece. Another covers an empty photographed island tile and its
-adjacent void while preserving the surrounding islands. One more, zoomed out too far, must be
-refused. These make 70 base scanner tests.
+Reads 63 screenshots and photos of the site and checks each against the true position up to
+translation: pieces, voids, promotion ranks and world border. They cover the 18 standard variants,
+zoom levels down to 7-pixel squares, several board themes, royals in check, black's side,
+perspective mode at several tilts and turns, a whole browser window, photos of the screen with
+things in front of it, and the separate islands of 4D boards. More lay menus over screenshots,
+resize, recompress and recolor photos, and draw boards straight from the sprites with new themes and
+camera noise, checking that nothing is invented. One more, zoomed out too far, must be refused.
 
-Three additional cases in [scanner.test.ts](test/scanner.test.ts) resize and JPEG-compress a new
-photo, change its exposure and RGB cast, or crop another photo while retaining every piece. They
-retain the strict piece counts, promotion ranks, exposed-square guards and border expectations.
-Seven boards in [generated.test.ts](test/generated.test.ts) use independent layouts rasterized
-directly from SVGs, with new themes, skew and display noise; they also guard against invented pieces
-and promotion lines. Controls add localized broad RGB bands over fine display noise and dense
-interleaved pawn ranks without promotion lines; a positive control draws colored promotion lines
-beneath the noise. Together these make 80 scanner tests.
-
-Three [palette tests](test/tiles.test.ts) distinguish screenshots from camera captures, including
-resized, compressed and low-contrast screenshots. Three [matcher tests](test/matcher.test.ts) cover
-all six player colors, glare, color casts and red check glows. The held-out background case adds 360
-generated glyphs, eight noisy bare tiles and eight patterned opaque covers, checking that noise and
-foreground do not become pieces. The suite contains 86 tests in total.
-
-Run `npm run benchmark` to measure warmed reads of representative screenshots and photos. It reports
-the median and range of three runs, together with the pieces and squares read. Pass fixture names
-after `--` to measure specific images.
+`npm run benchmark` times warm reads of a few screenshots and photos. Name fixtures after `--` to
+time those instead.
 
 ---
 

@@ -1,39 +1,48 @@
-/** Repeatable warm end-to-end measurements; run with npx tsx bench/scanner.ts [fixture.png ...]. */
+/**
+ * Times warm reads of fixtures: the ones named, or a few representative screenshots and photos.
+ * Run with `npm run benchmark -- [fixture.png ...]`.
+ */
+
 import fs from 'node:fs/promises';
 
 import { readScreenshot } from '../src/index.js';
 
-const names = process.argv.slice(2);
-const fixtures = names.length
-	? names
-	: [
-			'core.png',
-			'space-tilted.png',
-			'core-photo.png',
-			'4x4x4x4-chess-photo-4.png',
-			'abundance-photo.png',
-			'obstocean-photo-blue.png',
-		];
+// Constants -------------------------------------------------------------------
 
-for (const name of fixtures) {
+/** The fixtures timed when none are named. */
+const DEFAULT_FIXTURES = [
+	'core.png',
+	'space-tilted.png',
+	'core-photo.png',
+	'4x4x4x4-chess-photo-4.png',
+	'abundance-photo.png',
+	'obstocean-photo-blue.png',
+];
+
+/** How many timed reads each fixture gets, after one to warm up. */
+const REPEATS = 3;
+
+// Benchmark -------------------------------------------------------------------
+
+const names = process.argv.slice(2);
+for (const name of names.length > 0 ? names : DEFAULT_FIXTURES) {
 	const input = await fs.readFile(new URL(`../test/fixtures/${name}`, import.meta.url));
-	await readScreenshot(input);
+	const reading = await readScreenshot(input);
 	const elapsed: number[] = [];
-	let reading;
-	for (let repeat = 0; repeat < 3; repeat++) {
+	for (let repeat = 0; repeat < REPEATS; repeat++) {
 		const started = performance.now();
-		reading = await readScreenshot(input);
+		await readScreenshot(input);
 		elapsed.push(performance.now() - started);
 	}
 	elapsed.sort((a, b) => a - b);
 	console.log(
 		JSON.stringify({
 			image: name,
-			medianMs: Math.round(elapsed[1]!),
+			medianMs: Math.round(elapsed[Math.floor(REPEATS / 2)]!),
 			minimumMs: Math.round(elapsed[0]!),
-			maximumMs: Math.round(elapsed[2]!),
-			pieces: reading!.pieces.length,
-			shown: reading!.shown.size,
+			maximumMs: Math.round(elapsed[REPEATS - 1]!),
+			pieces: reading.pieces.length,
+			shown: reading.shown.size,
 		}),
 	);
 }

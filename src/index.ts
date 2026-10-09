@@ -260,7 +260,7 @@ function chooseView<T extends { view: View; squares: Square[] }>(
 			.filter((_, index) => index % stride === 0)
 			.slice(0, ORIENTATION_SEARCH);
 		const busy = sampleSquares(pic, view.pieces.toImage, largest)
-			.filter(isBusy)
+			.filter((square) => isBusy(square))
 			.filter(
 				(square) =>
 					!tiles.photographed ||

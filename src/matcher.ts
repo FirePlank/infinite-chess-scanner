@@ -250,7 +250,7 @@ export function chooseMatchers(
 	photographed = false,
 ): (sizeClass: SizeClass) => Matcher {
 	const busy = sampled
-		.filter(isBusy)
+		.filter((square) => isBusy(square))
 		.filter(
 			(square) =>
 				!photographed || !isPhotographicBackground(square.patch, square.sizeClass.samples),
