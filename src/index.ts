@@ -29,6 +29,7 @@ import {
 	chooseMatchers,
 	fitTemplate,
 	isBusy,
+	isPhotographicBackground,
 	patchSums,
 	rankFits,
 	sampleSquares,
@@ -130,11 +131,20 @@ function readBoard(
 		.sort((a, b) => a.square.row - b.square.row || a.square.column - b.square.column);
 	const matchers = chooseMatchers(
 		sprites,
-		onBoard.filter(({ square }) => direct.has(`${square.column},${square.row}`)),
+		onBoard.filter(({ square }) => {
+			const key = `${square.column},${square.row}`;
+			return direct.has(key) && (!tiles.photographed || !region.voids.has(key));
+		}),
 		tiles.photographed,
 	);
 	// At an angle, promotion lines reach into the squares beside them, which reads like a cover.
-	const reader: Reader = { pic, view, tiles, detectsCovers: obstructed || !view.perspective };
+	const reader: Reader = {
+		pic,
+		view,
+		tiles,
+		inferred: region.inferred,
+		detectsCovers: obstructed || !view.perspective,
+	};
 	const frame = frameOf(region.squares, region.darkParity, options.perspective === 'black'); // prettier-ignore
 
 	const pieces: PlacedPiece[] = [];
@@ -143,16 +153,29 @@ function readBoard(
 	let covered = false;
 	for (const sampled of onBoard) {
 		const { square } = sampled;
-		const verdict = classify(reader, sampled, matchers);
+		const verdict =
+			tiles.photographed &&
+			direct.has(`${square.column},${square.row}`) &&
+			region.voids.has(`${square.column},${square.row}`)
+				? { kind: 'void' as const }
+				: classify(reader, sampled, matchers);
 		if (verdict.kind === 'obscured') {
 			covered = true;
 			continue;
 		}
 		if (!direct.has(`${square.column},${square.row}`)) {
 			const neighbors = region.neighbors.get(`${square.column},${square.row}`)!;
+			const edge =
+				square.column === region.extent.left ||
+				square.column === region.extent.right ||
+				square.row === region.extent.top ||
+				square.row === region.extent.bottom;
+			const minimumNeighbors = tiles.photographed && edge ? 2 : 3;
 			if (
 				verdict.kind === 'empty' ||
-				(neighbors < 3 && (verdict.kind !== 'piece' || verdict.piece.kind.code !== 'ob'))
+				(tiles.photographed && verdict.kind === 'void') ||
+				(neighbors < minimumNeighbors &&
+					(verdict.kind !== 'piece' || verdict.piece.kind.code !== 'ob'))
 			)
 				continue;
 		}
@@ -236,9 +259,13 @@ function chooseView<T extends { view: View; squares: Square[] }>(
 		const largest = ordered
 			.filter((_, index) => index % stride === 0)
 			.slice(0, ORIENTATION_SEARCH);
-		const busy = sampleSquares(pic, view.pieces.toImage, largest).filter((square) =>
-			isBusy(square),
-		);
+		const busy = sampleSquares(pic, view.pieces.toImage, largest)
+			.filter(isBusy)
+			.filter(
+				(square) =>
+					!tiles.photographed ||
+					!isPhotographicBackground(square.patch, square.sizeClass.samples),
+			);
 		const matchers = chooseMatchers(sprites, busy, tiles.photographed);
 		if (busy.length === 0) return Infinity;
 		const fits = busy.map(({ sizeClass, patch }) => {

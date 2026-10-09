@@ -14,6 +14,13 @@ import { compose, fitHomography, project } from './homography.js';
 /** Board-grid coordinates, as `column,row`. */
 type LatticeKey = `${number},${number}`;
 
+/** A geometric consensus, retaining only the crossings that support its map. */
+interface LatticeFit {
+	corners: Map<LatticeKey, Point>;
+	toImage: Homography;
+	observations: number;
+}
+
 // Constants -------------------------------------------------------------------
 
 /** The radius of the ring of pixels a corner is recognized by. */
@@ -91,6 +98,82 @@ export function findCorners(pic: Picture, classes: Int8Array, shades?: Float32Ar
 	}
 	const corners = clusterCenters(hits, width, shades ? 8 : 1);
 	return shades ? corners.map((corner) => refineCorner(corner, shades, width)) : corners;
+}
+
+/** Camera exposure changes across a display, so each crossing supplies its own two colors. */
+export function findPhotographedCorners(pic: Picture): Point[] {
+	const { width, height, sat } = pic;
+	const smooth = new Float32Array(width * height * 3);
+	const brightness = new Float32Array(width * height);
+	const stride = (width + 1) * 3;
+	for (let y = 2; y < height - 2; y++) {
+		for (let x = 2; x < width - 2; x++) {
+			const a = (y - 2) * stride + (x - 2) * 3;
+			const b = a + 15;
+			const c = a + 5 * stride;
+			const d = c + 15;
+			const at = (y * width + x) * 3;
+			for (let channel = 0; channel < 3; channel++)
+				smooth[at + channel] =
+					(sat[d + channel]! -
+						sat[b + channel]! -
+						sat[c + channel]! +
+						sat[a + channel]!) /
+					25;
+			brightness[y * width + x] =
+				0.299 * smooth[at]! + 0.587 * smooth[at + 1]! + 0.114 * smooth[at + 2]!;
+		}
+	}
+	const hits = new Uint8Array(width * height);
+	const stencils = [4, 7].flatMap((reach) => [
+		[-reach, -reach * width, reach, reach * width],
+		[
+			-reach * width - reach,
+			-reach * width + reach,
+			reach * width + reach,
+			reach * width - reach,
+		],
+	]);
+	for (let y = 9; y < height - 9; y++) {
+		for (let x = 9; x < width - 9; x++) {
+			const at = y * width + x;
+			for (const offsets of stencils) {
+				if (
+					Math.min(
+						Math.abs(brightness[at + offsets[0]!]! - brightness[at + offsets[1]!]!),
+						Math.abs(brightness[at + offsets[2]!]! - brightness[at + offsets[3]!]!),
+					) < 0.04
+				)
+					continue;
+				const a = (at + offsets[0]!) * 3;
+				const b = (at + offsets[1]!) * 3;
+				const c = (at + offsets[2]!) * 3;
+				const d = (at + offsets[3]!) * 3;
+				const variation = Math.max(
+					squaredColorDistance(smooth, a, c),
+					squaredColorDistance(smooth, b, d),
+				);
+				if (variation >= 0.01) continue;
+				const contrast = Math.min(
+					squaredColorDistance(smooth, a, b),
+					squaredColorDistance(smooth, c, d),
+				);
+				if (contrast > Math.max(0.0144, 3.24 * variation)) {
+					hits[at] = 1;
+					break;
+				}
+			}
+		}
+	}
+	return clusterCenters(hits, width, 8).map((corner) => refineCorner(corner, brightness, width));
+}
+
+/** Color comparisons in the image scan need no temporary RGB triples or square roots. */
+function squaredColorDistance(rgb: Float32Array, a: number, b: number): number {
+	const dr = rgb[a]! - rgb[b]!;
+	const dg = rgb[a + 1]! - rgb[b + 1]!;
+	const db = rgb[a + 2]! - rgb[b + 2]!;
+	return dr * dr + dg * dg + db * db;
 }
 
 /** The saddle of a local quadratic locates the crossing beneath display stripes and blur. */
@@ -227,12 +310,11 @@ export function fitLattice(
 	height: number,
 	photographed = false,
 	check?: (h: Homography, centers: Point[]) => boolean,
+	local = false,
 ): Homography[] | undefined {
-	const lattice = growLattice(corners, width, height, photographed, check);
-	if (lattice === undefined) return undefined;
-	const h = fitRobustly(lattice, photographed ? 3 : OUTLIER_DISTANCE);
-	if (h === undefined) return undefined;
-	return orientations(h).map((relabeling) => compose(h, relabeling));
+	const fit = growLattice(corners, width, height, photographed, check, local);
+	if (fit === undefined) return undefined;
+	return orientations(fit.toImage).map((relabeling) => compose(fit.toImage, relabeling));
 }
 
 /**
@@ -245,7 +327,8 @@ function growLattice(
 	height: number,
 	photographed: boolean,
 	check?: (h: Homography, centers: Point[]) => boolean,
-): Map<LatticeKey, Point> | undefined {
+	local = false,
+): LatticeFit | undefined {
 	const index = new CornerIndex(corners);
 	const middle: Point = [width / 2, height / 2];
 	// Seeds spread outward from the middle, as stray corners cluster where pieces stand.
@@ -261,28 +344,41 @@ function growLattice(
 			const seed = byDistance[i]!;
 			if (!seeds.includes(seed)) seeds.push(seed);
 		}
+		// A small disconnected board may have only one crossing with neighbors on both axes.
+		// Sampling every nth crossing can miss all such seeds, so retain the remaining attempts.
+		if (local) for (const seed of byDistance) if (!seeds.includes(seed)) seeds.push(seed);
 	}
-	let best: Map<LatticeKey, Point> | undefined;
+	let best: LatticeFit | undefined;
 	for (const seed of seeds) {
-		const initial = photographed ? photoSeeds(seed, index) : [seedLattice(seed, index)];
+		const initial = photographed
+			? photoSeeds(seed, index, local ? 10 : 20)
+			: [seedLattice(seed, index)];
 		for (const candidate of initial) {
 			if (!candidate) continue;
-			const lattice = growFrom(candidate, index, width, height);
-			if (!lattice || lattice.size <= (best?.size ?? 0)) continue;
+			const grown = growFrom(candidate, index, width, height);
+			if (!grown || grown.size <= (local ? best?.corners.size ?? 0 : best?.observations ?? 0)) continue; // prettier-ignore
+			const fit = fitRobustly(grown, photographed ? 3 : OUTLIER_DISTANCE);
+			if (!fit || (local && fit.corners.size <= (best?.corners.size ?? 0))) continue;
+			const lattice = grown;
 			if (check) {
-				const h = fitRobustly(lattice, 3);
 				const centers: Point[] = [];
 				for (const key of lattice.keys()) {
 					const [column, row] = key.split(',').map(Number) as Point;
 					if (lattice.has(`${column + 1},${row}`) && lattice.has(`${column},${row + 1}`) && lattice.has(`${column + 1},${row + 1}`)) centers.push([column + 0.5, row + 0.5]); // prettier-ignore
 				}
-				if (!h || !check(h, centers)) continue;
+				if (!check(fit.toImage, centers)) continue;
 			}
-			best = lattice;
+			best = fit;
 		}
-		if (best && (best.size >= ENOUGH_LATTICE_CORNERS || best.size > corners.length / 2)) break;
+		if (
+			best &&
+			((local ? best.corners.size : best.observations) >=
+				(local ? 100 : ENOUGH_LATTICE_CORNERS) ||
+				best.observations > corners.length / 2)
+		)
+			break;
 	}
-	return best && best.size >= MIN_LATTICE_CORNERS ? best : undefined;
+	return best;
 }
 
 /** Grows the lattice out from one corner, ring by ring, predicting each corner by the homography fitted so far. */
@@ -303,8 +399,8 @@ function growFrom(
 	) {
 		let added = 0;
 		for (let column = -radius; column <= radius; column++) {
-			for (let row = -radius; row <= radius; row++) {
-				if (Math.max(Math.abs(column), Math.abs(row)) !== radius) continue;
+			const step = Math.abs(column) === radius ? 1 : 2 * radius;
+			for (let row = -radius; row <= radius; row += step) {
 				const corner = snap(h, column, row, index, used, width, height);
 				if (corner === undefined) continue;
 				lattice.set(`${column},${row}`, corner);
@@ -323,8 +419,14 @@ function growFrom(
 }
 
 /** Several nearby crosses, clearing small marks and pieces that can obscure the nearest corner. */
-function photoSeeds(seed: Point, index: CornerIndex): Map<LatticeKey, Point>[] {
-	const nearby = index.near(seed, SEED_NEIGHBORHOOD).filter((p) => distance(p, seed) > 20);
+function photoSeeds(
+	seed: Point,
+	index: CornerIndex,
+	minimumSpacing = 20,
+): Map<LatticeKey, Point>[] {
+	const nearby = index
+		.near(seed, SEED_NEIGHBORHOOD)
+		.filter((p) => distance(p, seed) > minimumSpacing);
 	nearby.sort((a, b) => distance(a, seed) - distance(b, seed));
 	const seeds: Map<LatticeKey, Point>[] = [];
 	for (const first of nearby.slice(0, 8)) {
@@ -388,7 +490,7 @@ function snap(
 }
 
 /** Fits the lattice's homography, refitting without the corners that disagree with it. */
-function fitRobustly(lattice: Map<LatticeKey, Point>, tolerance: number): Homography | undefined {
+function fitRobustly(lattice: Map<LatticeKey, Point>, tolerance: number): LatticeFit | undefined {
 	let pairs = pairsOf(lattice);
 	let h = fitHomography(pairs);
 	for (let round = 0; round < 3; round++) {
@@ -396,7 +498,10 @@ function fitRobustly(lattice: Map<LatticeKey, Point>, tolerance: number): Homogr
 		if (pairs.length < MIN_LATTICE_CORNERS) return undefined;
 		h = fitHomography(pairs);
 	}
-	return h;
+	const corners = new Map<LatticeKey, Point>(
+		pairs.map(([at, corner]) => [`${at[0]},${at[1]}`, corner]),
+	);
+	return { corners, toImage: h, observations: lattice.size };
 }
 
 /**

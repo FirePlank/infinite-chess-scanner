@@ -8,12 +8,19 @@ import type { Grid } from './grid.js';
 import type { Picture } from './picture.js';
 import type { Tiles } from './tiles.js';
 import type { Homography, Point } from './homography.js';
+import type { RGB } from './color.js';
 
 import { EDGE_TOLERANCE, findGrid } from './grid.js';
 import { colorDistance } from './color.js';
 import { colorAt } from './picture.js';
 import { isTileColor, tileShades } from './tiles.js';
-import { findCorners, fitLattice, isCornerNear, tileClasses } from './lattice.js';
+import {
+	findCorners,
+	findPhotographedCorners,
+	fitLattice,
+	isCornerNear,
+	tileClasses,
+} from './lattice.js';
 import {
 	compose,
 	fitHomography,
@@ -95,16 +102,39 @@ export function findViews(pic: Picture, tiles: Tiles, embedded = false): View[] 
 	const classes = tileClasses(shades);
 	let grid: Grid | undefined;
 	let gridError: unknown;
-	try {
-		grid = findGrid(pic, shades);
-	} catch (error) {
-		gridError = error;
+	if (!tiles.photographed) {
+		try {
+			grid = findGrid(pic, shades);
+		} catch (error) {
+			gridError = error;
+		}
 	}
 	if (grid && !tiles.photographed && areGridCornersShown(pic, classes, grid))
 		return [flatView(grid)];
-	const corners = findCorners(pic, classes, tiles.photographed ? shades : undefined);
+	let corners = findCorners(pic, classes, tiles.photographed ? shades : undefined);
 	if (grid && !tiles.photographed && isGridOnCorners(grid, corners)) return [flatView(grid)];
-	let homographies = fitLattice(corners, pic.width, pic.height, tiles.photographed, tiles.photographed ? (h, centers) => photoCheckered(pic, shades, h, centers) : undefined); // prettier-ignore
+	let homographies = fitLattice(corners, pic.width, pic.height, tiles.photographed, tiles.photographed ? (h, centers) => isCheckerLattice(pic, h, centers, shades) : undefined); // prettier-ignore
+	if (tiles.photographed && (!homographies || corners.length < 150)) {
+		const localCorners = findPhotographedCorners(pic);
+		const local = fitLattice(
+			localCorners,
+			pic.width,
+			pic.height,
+			true,
+			(h, centers) => isCheckerLattice(pic, h, centers),
+			true,
+		);
+		if (
+			local &&
+			(!homographies ||
+				(samePhotoGrid(homographies[0]!, local[0]!) &&
+					cornerAgreement(local[0]!, localCorners) >
+						1.25 * cornerAgreement(homographies[0]!, localCorners)))
+		) {
+			homographies = local;
+			corners = localCorners;
+		}
+	}
 	if (homographies) {
 		if (tiles.photographed) {
 			const initial = homographies[0]!;
@@ -116,10 +146,46 @@ export function findViews(pic: Picture, tiles: Tiles, embedded = false): View[] 
 		}
 		const center = embedded && !tiles.photographed ? viewportCenter(pic, shades) : undefined;
 		const views = homographies.map((toImage) => perspectiveView(pic, toImage, tiles.photographed, center, corners)); // prettier-ignore
+		// Closely spaced round obstacles can supply a checkerboard of edge midpoints, rotated
+		// halfway between the real axes. Keep the real-cell alternatives for piece shapes to judge.
+		if (tiles.photographed && hasAlternatingMarks(pic, views[0]!)) {
+			for (const h of homographies) {
+				for (const phase of [-0.5, 0.5]) {
+					const toImage = compose(h, [1, -1, 0.5, 1, 1, phase, 0, 0, 1]);
+					const alternative = perspectiveView(pic, toImage, true, undefined, corners);
+					if ((alternative.cornerSupport?.size ?? 0) >= 16) views.push(alternative);
+				}
+			}
+		}
 		if (tiles.photographed || isCheckered(pic, tiles, views[0]!)) return views;
 	}
 	if (grid && !tiles.photographed) return [flatView(grid)];
 	throw gridError ?? new Error('No checkerboard with readable squares found in the image.');
+}
+
+/** A genuine dark tile stays dark at its rim; a mark mistaken for that tile has a bright rim. */
+function hasAlternatingMarks(pic: Picture, view: View): boolean {
+	const counts = [0, 0];
+	const marks = [0, 0];
+	const plain = [0, 0];
+	for (const { column, row } of view.squares) {
+		if (
+			![`${column},${row}`, `${column + 1},${row}`, `${column},${row + 1}`, `${column + 1},${row + 1}`].every((key) => view.cornerSupport?.has(key)) // prettier-ignore
+		)
+			continue;
+		const center = colorNear(pic, view.toImage, column + 0.5, row + 0.5, 2);
+		const rim = [[0.15, 0.15], [0.85, 0.15], [0.85, 0.85], [0.15, 0.85]].map(([x, y]) => colorNear(pic, view.toImage, column + x!, row + y!, 2)); // prettier-ignore
+		if (!center || rim.some((color) => !color)) continue;
+		const colors = rim as [number, number, number][];
+		const background = [0, 1, 2].map((channel) => colors.reduce((sum, color) => sum + color[channel]!, 0) / 4) as [number, number, number]; // prettier-ignore
+		if (colors.some((color) => colorDistance(color, background) > 0.08)) continue;
+		const parity = (((column + row) % 2) + 2) % 2;
+		counts[parity]!++;
+		const contrast = colorDistance(center, background);
+		if (contrast < 0.08) plain[parity]!++;
+		else if (contrast > 0.15 && center.reduce((sum, value) => sum + value, 0) < background.reduce((sum, value) => sum + value, 0) - 0.15) marks[parity]!++; // prettier-ignore
+	}
+	return [0, 1].some((parity) => counts[parity]! >= 20 && counts[1 - parity]! >= 20 && marks[parity]! > counts[parity]! * 0.6 && plain[1 - parity]! > counts[1 - parity]! * 0.6); // prettier-ignore
 }
 
 /**
@@ -132,26 +198,41 @@ function refinePhotograph(pic: Picture, view: View): Homography | undefined {
 		`${column},${row}`, `${column + 1},${row}`, `${column},${row + 1}`, `${column + 1},${row + 1}`,
 	])); // prettier-ignore
 	const measured = new Map<string, [Point, Point]>();
+	// Choose the stencil at the lattice seed, where its checkerboard was established. A large
+	// board can extrapolate to tiny cells outside its viewport, where display marks are noise.
+	const size = 1 / stretch(view.toBoard, ...project(view.toImage, 0, 0));
+	const small = size < 30;
+	const radius = small ? 1 : 2;
+	const reaches = small ? [0.16, 0.28] : [0.065, 0.13];
+	const colors: RGB[] = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]; // prettier-ignore
 	for (const key of coordinates) {
 		const [column, row] = key.split(',').map(Number) as Point;
+		// At small zoom levels a five-pixel average straddles the crossing at the usual reach.
+		// Sample farther into each quadrant, using a smaller patch to leave its edges behind.
 		let best: Point | undefined;
 		let bestQuality = -Infinity;
 		for (let dy = -8; dy <= 8; dy++) {
 			for (let dx = -8; dx <= 8; dx++) {
-				const [u, v] = [column + dx * 0.025, row + dy * 0.025];
+				const u = column + dx * 0.025;
+				const v = row + dy * 0.025;
 				let quality = -0.005 * Math.hypot(dx, dy);
 				let checkered = true;
-				for (const reach of [0.065, 0.13]) {
-					const a = colorNear(pic, view.toImage, u - reach, v - reach, 2);
-					const b = colorNear(pic, view.toImage, u + reach, v - reach, 2);
-					const c = colorNear(pic, view.toImage, u + reach, v + reach, 2);
-					const d = colorNear(pic, view.toImage, u - reach, v + reach, 2);
+				for (const reach of reaches) {
+					const a = colorNear(pic, view.toImage, u - reach, v - reach, radius, colors[0]);
+					const b = colorNear(pic, view.toImage, u + reach, v - reach, radius, colors[1]);
+					const c = colorNear(pic, view.toImage, u + reach, v + reach, radius, colors[2]);
+					const d = colorNear(pic, view.toImage, u - reach, v + reach, radius, colors[3]);
 					if (!a || !b || !c || !d) {
 						checkered = false;
 						break;
 					}
+					const firstContrast = colorDistance(a, b);
+					if (firstContrast < 0.1) {
+						checkered = false;
+						break;
+					}
+					const contrast = Math.min(firstContrast, colorDistance(c, d));
 					const variation = Math.max(colorDistance(a, c), colorDistance(b, d));
-					const contrast = Math.min(colorDistance(a, b), colorDistance(c, d));
 					if (variation > 0.1 || contrast < Math.max(0.1, 2 * variation)) {
 						checkered = false;
 						break;
@@ -164,7 +245,7 @@ function refinePhotograph(pic: Picture, view: View): Homography | undefined {
 				}
 			}
 		}
-		if (best) measured.set(key, [[column, row], best]);
+		if (best) measured.set(key, [[column, row], small ? refineSmallCrossing(pic, best) : best]);
 	}
 	// Isolated marks can resemble a crossing. A measured grid crossing has measured neighbors.
 	const pairs = [...measured.values()].filter(([[column, row]]) => [
@@ -173,6 +254,35 @@ function refinePhotograph(pic: Picture, view: View): Homography | undefined {
 	if (pairs.length < 12) return undefined;
 	const toImage = fitHomography(pairs);
 	return toImage.every(Number.isFinite) ? toImage : undefined;
+}
+
+/** The saddle of an averaged crossing locates its edges within the broad quadrant-score peak. */
+function refineSmallCrossing(pic: Picture, point: Point): Point {
+	const [cx, cy] = point.map(Math.floor) as Point;
+	let bx = 0;
+	let by = 0;
+	let xx = 0;
+	let xy = 0;
+	let yy = 0;
+	const identity = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+	for (let y = -4; y <= 4; y++) {
+		for (let x = -4; x <= 4; x++) {
+			const color = colorNear(pic, identity, cx + x, cy + y, 2);
+			if (!color) return point;
+			const value = color[0] + color[1] + color[2];
+			bx += value * x;
+			by += value * y;
+			xx += value * (x * x - 20 / 3);
+			xy += value * x * y;
+			yy += value * (y * y - 20 / 3);
+		}
+	}
+	[bx, by, xx, xy, yy] = [bx / 540, by / 540, xx / 2772, xy / 3600, yy / 2772];
+	const determinant = 4 * xx * yy - xy * xy;
+	if (!(determinant < -1e-8)) return point;
+	const x = (xy * by - 2 * yy * bx) / determinant;
+	const y = (xy * bx - 2 * xx * by) / determinant;
+	return Math.hypot(x, y) < 3 ? [cx + 0.5 + x, cy + 0.5 + y] : point;
 }
 
 /** The center of a board viewport embedded between broad application bars. */
@@ -194,24 +304,123 @@ function viewportCenter(pic: Picture, shades: Float32Array): Point | undefined {
 	return [pic.width / 2, (first + last + 1) / 2];
 }
 
-/** Tests bare square centers supported on all four sides by the detected photograph lattice. */
-function photoCheckered(
+/**
+ * A lattice must explain alternating tiles throughout its projected image domain. Restricting
+ * the check to its seed's crossings can accept a small periodic moire patch as the whole board.
+ * Local color differences keep this test independent of camera exposure and the global palette.
+ */
+function isCheckerLattice(
 	pic: Picture,
-	shades: Float32Array,
 	h: Homography,
 	centers: Point[],
+	shades?: Float32Array,
 ): boolean {
 	let even = 0;
 	let odd = 0;
+	const nearby = new Set(centers.map(([column, row]) => `${column},${row}`));
 	for (const [column, row] of centers) {
-		const [x, y] = project(h, column, row);
-		const shade = shades[Math.floor(y) * pic.width + Math.floor(x)]!;
-		if (!Number.isFinite(shade) || (shade > 0.35 && shade < 0.65)) continue;
 		const expected = (((Math.floor(column) + Math.floor(row)) % 2) + 2) % 2 === 0;
-		if (shade < 0.5 === expected) even++;
+		if (shades) {
+			const [x, y] = project(h, column, row);
+			const shade = shades[Math.floor(y) * pic.width + Math.floor(x)]!;
+			if (!Number.isFinite(shade) || (shade > 0.35 && shade < 0.65)) continue;
+			if (shade < 0.5 === expected) even++;
+			else odd++;
+			continue;
+		}
+		const color = colorNear(pic, h, column, row, 2);
+		if (!color) continue;
+		const others = [
+			[column + 1, row],
+			[column - 1, row],
+			[column, row + 1],
+			[column, row - 1],
+		]
+			.filter(([c, r]) => nearby.has(`${c},${r}`))
+			.map(([c, r]) => colorNear(pic, h, c!, r!, 2))
+			.filter((neighbor) => neighbor && colorDistance(color, neighbor) > 0.1);
+		if (others.length < 2) continue;
+		const brightness = color.reduce((sum, value) => sum + value, 0);
+		const darker = others.every(
+			(neighbor) => brightness < neighbor!.reduce((sum, value) => sum + value, 0) - 0.1,
+		);
+		const lighter = others.every(
+			(neighbor) => brightness > neighbor!.reduce((sum, value) => sum + value, 0) + 0.1,
+		);
+		if (!darker && !lighter) continue;
+		if (darker === expected) even++;
 		else odd++;
 	}
-	return even + odd >= Math.max(6, centers.length * 0.25) && Math.max(even, odd) >= CHECKERED_AGREEMENT * (even + odd); // prettier-ignore
+	if (even + odd < Math.max(6, centers.length * 0.25) || Math.max(even, odd) < CHECKERED_AGREEMENT * (even + odd)) return false; // prettier-ignore
+	return !!shades || !contradictsCheckerDomain(pic, h);
+}
+
+/** Many reliable contrary votes reject a local periodic patch; sparse occlusion evidence cannot. */
+function contradictsCheckerDomain(pic: Picture, h: Homography): boolean {
+	let squares: Square[];
+	try {
+		squares = perspectiveView(pic, h, true).squares;
+	} catch {
+		return true;
+	}
+	const nearby = new Set(squares.map(({ column, row }) => `${column},${row}`));
+	let even = 0;
+	let odd = 0;
+	const stride = Math.max(1, Math.ceil(squares.length / 600));
+	for (let index = 0; index < squares.length; index += stride) {
+		const { column, row } = squares[index]!;
+		const color = colorNear(pic, h, column + 0.5, row + 0.5, 2);
+		if (!color) continue;
+		const neighbors = [
+			[-1, 0],
+			[1, 0],
+			[0, -1],
+			[0, 1],
+		]
+			.filter(([dx, dy]) => nearby.has(`${column + dx!},${row + dy!}`))
+			.map(([dx, dy]) => colorNear(pic, h, column + dx! + 0.5, row + dy! + 0.5, 2))
+			.filter((neighbor): neighbor is [number, number, number] => !!neighbor);
+		if (neighbors.length < 3) continue;
+		const mean = [0, 1, 2].map((channel) => neighbors.reduce((sum, neighbor) => sum + neighbor[channel]!, 0) / neighbors.length) as [number, number, number]; // prettier-ignore
+		const contrast = colorDistance(color, mean);
+		const variation = Math.max(...neighbors.map((neighbor) => colorDistance(neighbor, mean)));
+		if (contrast < 0.1 || variation > 0.45 * contrast) continue;
+		const darker = color.reduce((sum, value) => sum + value, 0) < mean.reduce((sum, value) => sum + value, 0); // prettier-ignore
+		if (darker === ((((column + row) % 2) + 2) % 2 === 0)) even++;
+		else odd++;
+	}
+	const total = even + odd;
+	const expectedErrors = (1 - CHECKERED_AGREEMENT) * total;
+	const uncertainty = 3 * Math.sqrt(CHECKERED_AGREEMENT * expectedErrors);
+	return Math.min(even, odd) > expectedErrors + uncertainty;
+}
+
+/** How many independent local crossings sit on a recovered grid. */
+function cornerAgreement(h: Homography, corners: Point[]): number {
+	const toBoard = invert(h);
+	const supported = new Set<string>();
+	for (const corner of corners) {
+		const [column, row] = project(toBoard, ...corner);
+		const [c, r] = [Math.round(column), Math.round(row)];
+		if (Math.abs(column - c) < 0.15 && Math.abs(row - r) < 0.15) supported.add(`${c},${r}`);
+	}
+	return supported.size;
+}
+
+/** A better exposed part can refine a photographed grid without changing its square spacing. */
+function samePhotoGrid(reference: Homography, candidate: Homography): boolean {
+	const relabeling = compose(invert(candidate), reference);
+	const origin = project(relabeling, 0, 0);
+	return [
+		[1, 0],
+		[0, 1],
+	].every(([column, row]) => {
+		const point = project(relabeling, column!, row!);
+		const dx = point[0] - origin[0];
+		const dy = point[1] - origin[1];
+		const length = Math.hypot(dx, dy);
+		return length > 0.8 && length < 1.25 && Math.max(Math.abs(dx), Math.abs(dy)) > 0.9 * length;
+	});
 }
 
 /**
@@ -419,9 +628,11 @@ function colorNear(
 	column: number,
 	row: number,
 	radius: number,
-): [number, number, number] | undefined {
-	const [px, py] = project(toImage, column, row);
-	const [x, y] = [Math.floor(px), Math.floor(py)];
+	out: RGB = [0, 0, 0],
+): RGB | undefined {
+	const w = toImage[6]! * column + toImage[7]! * row + toImage[8]!;
+	const x = Math.floor((toImage[0]! * column + toImage[1]! * row + toImage[2]!) / w);
+	const y = Math.floor((toImage[3]! * column + toImage[4]! * row + toImage[5]!) / w);
 	if (x < radius || y < radius || x >= pic.width - radius || y >= pic.height - radius) return undefined; // prettier-ignore
 	const stride = (pic.width + 1) * 3;
 	const side = 2 * radius + 1;
@@ -429,7 +640,11 @@ function colorNear(
 	const b = a + side * 3;
 	const c = a + side * stride;
 	const d = c + side * 3;
-	return [0, 1, 2].map((channel) => (pic.sat[d + channel]! - pic.sat[b + channel]! - pic.sat[c + channel]! + pic.sat[a + channel]!) / (side * side)) as [number, number, number]; // prettier-ignore
+	const area = side * side;
+	out[0] = (pic.sat[d]! - pic.sat[b]! - pic.sat[c]! + pic.sat[a]!) / area;
+	out[1] = (pic.sat[d + 1]! - pic.sat[b + 1]! - pic.sat[c + 1]! + pic.sat[a + 1]!) / area;
+	out[2] = (pic.sat[d + 2]! - pic.sat[b + 2]! - pic.sat[c + 2]! + pic.sat[a + 2]!) / area;
+	return out;
 }
 
 /** A square, if it's fully on screen and large enough to read. */

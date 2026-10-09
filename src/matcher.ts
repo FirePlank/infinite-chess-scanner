@@ -72,6 +72,10 @@ export interface Matcher {
 	glow: Float32Array;
 	/** How many sprites have templates. */
 	count: number;
+	/** Template indices for each shape, so player variants need no full-resolution rendering. */
+	variants: ReadonlyMap<string, readonly number[]>;
+	/** Number of compared samples, shared by every fit. */
+	compared: number;
 	/** A sprite's template, built when first asked for. */
 	template: (index: number) => Template;
 	/** The fully transparent template. */
@@ -82,10 +86,23 @@ export interface Matcher {
 	photographed?: true;
 }
 
-/** A photographed square's affine brightness response, shared across its RGB channels. */
+/** A photographed square's affine response, with one gain and a bounded local color cast. */
 export interface CameraResponse {
 	gain: number;
 	offset: RGB;
+}
+
+/** A camera tile's smooth background, calibrated without looking at its glyph-bearing interior. */
+export interface PhotoBackground {
+	mean: RGB;
+	dx: RGB;
+	dy: RGB;
+	/** RGB residual energy per perimeter sample, after fitting the smooth background. */
+	noise: number;
+	/** Uncertainty of that noise across four sides, preserving camera noise's spatial correlation. */
+	noiseUncertainty: number;
+	/** Residual energy per interior sample against the independent background prediction. */
+	interior: number;
 }
 
 /** Patch-only sums shared by every template fit of one square. */
@@ -159,6 +176,21 @@ const MASKS = new Map<number, Uint8Array>();
 /** Small photographic alignment corrections, shared by repeated fits of the same template. */
 const ALIGNED = new WeakMap<Template, Template[]>();
 
+/** Wider corrections used only when an unexplained glyph has measured grid support. */
+const WIDE_ALIGNED = new WeakMap<Template, Template[]>();
+
+/** Independent background evidence shared by every candidate fitting one photographic patch. */
+const CAMERA_CAST_LIMITS = new WeakMap<Float32Array, number>();
+
+/** Template-only camera projection terms shared by its many alignment fits. */
+const CAMERA_TERMS = new WeakMap<Template, CameraTerms>();
+
+/** Each photographic tile's independent background calibration, reused by screening and fitting. */
+const PHOTO_BACKGROUNDS = new WeakMap<Float32Array, PhotoBackground>();
+
+/** Photographic shortlists reused while estimating blur and then reading the same patches. */
+const RANKED = new WeakMap<Matcher, WeakMap<Float32Array, Fit[]>>();
+
 // Building --------------------------------------------------------------------
 
 /**
@@ -217,7 +249,12 @@ export function chooseMatchers(
 	sampled: SampledSquare[],
 	photographed = false,
 ): (sizeClass: SizeClass) => Matcher {
-	const busy = sampled.filter((square) => isBusy(square));
+	const busy = sampled
+		.filter(isBusy)
+		.filter(
+			(square) =>
+				!photographed || !isPhotographicBackground(square.patch, square.sizeClass.samples),
+		);
 	const render = renderer(sprites);
 	const asPhotographed = (matcher: Matcher): Matcher => {
 		if (photographed) {
@@ -227,16 +264,22 @@ export function chooseMatchers(
 		return matcher;
 	};
 	const build = (sizeClass: SizeClass, sigma: number): Matcher =>
-		asPhotographed(buildMatcher(sprites, render, sizeClass, sigma));
+		asPhotographed(buildMatcher(sprites, render, sizeClass, sigma, photographed));
 
 	const middle = new Map<SizeClass, Matcher>();
 	const middleAt = (sizeClass: SizeClass): Matcher => {
 		if (!middle.has(sizeClass)) middle.set(sizeClass, build(sizeClass, MIDDLE_SIGMA));
 		return middle.get(sizeClass)!;
 	};
-	// Camera noise can make every bare tile busy. Estimate blur and brightness from pieces alone.
+	// Camera noise can make every bare tile busy. Average center-to-corner contrast to select
+	// a bounded pool before fitting glyphs, then estimate blur from its pieces alone.
+	const pool = photographed && busy.length > 4 * BLUR_PROBE_COUNT
+		? busy.map((square) => ({ square, contrast: photoContrast(square.patch, square.sizeClass.samples) }))
+			.sort((a, b) => b.contrast - a.contrast)
+			.slice(0, 4 * BLUR_PROBE_COUNT).map(({ square }) => square)
+		: busy; // prettier-ignore
 	const candidates = photographed
-		? busy.filter(({ sizeClass, patch }) => {
+		? pool.filter(({ sizeClass, patch }) => {
 				const matcher = middleAt(sizeClass);
 				const sums = patchSums(matcher, patch);
 				return rankFits(matcher, patch, sums)[0]!.residual < 0.8 * fitTemplate(matcher.empty, matcher, patch, sums).residual; // prettier-ignore
@@ -289,6 +332,21 @@ export function chooseMatchers(
 	return (sizeClass) => asPhotographed(matcherAt(sizeClass));
 }
 
+/** A cheap center-to-corner contrast averages camera stripes before selecting blur probes. */
+function photoContrast(patch: Float32Array, samples: number): number {
+	const difference: RGB = [0, 0, 0];
+	for (const y of [0.35, 0.45, 0.55, 0.65])
+		for (const x of [0.35, 0.45, 0.55, 0.65]) {
+			const center = (Math.floor(y * samples) * samples + Math.floor(x * samples)) * 3;
+			const edgeX = x < 0.5 ? x - 0.3 : x + 0.3;
+			const edgeY = y < 0.5 ? y - 0.3 : y + 0.3;
+			const corner =
+				(Math.floor(edgeY * samples) * samples + Math.floor(edgeX * samples)) * 3;
+			for (let c = 0; c < 3; c++) difference[c]! += patch[center + c]! - patch[corner + c]!;
+		}
+	return difference.reduce((sum, value) => sum + value * value, 0);
+}
+
 /** Renders sprites at a square size and resolution, each kept once rendered. */
 function renderer(
 	sprites: Sprite[],
@@ -311,12 +369,18 @@ function buildMatcher(
 	render: (size: number, samples: number, index: number) => Float32Array,
 	{ size, samples }: SizeClass,
 	sigma: number,
+	photographed: boolean,
 ): Matcher {
+	const full: Float32Array[] = [];
+	const fullAt = (index: number): Float32Array =>
+		(full[index] ??= blur(render(size, samples, index), samples, sigma));
 	const coarse =
 		samples >= 1.5 * COARSE_SAMPLES
-			? matcherOf(sprites, COARSE_SAMPLES, (index) => blur(render((size * COARSE_SAMPLES) / samples, COARSE_SAMPLES, index), COARSE_SAMPLES, (sigma * COARSE_SAMPLES) / samples)) // prettier-ignore
+			? matcherOf(sprites, COARSE_SAMPLES, (index) => photographed ? resample(fullAt(index), samples, COARSE_SAMPLES, 4) : blur(render((size * COARSE_SAMPLES) / samples, COARSE_SAMPLES, index), COARSE_SAMPLES, (sigma * COARSE_SAMPLES) / samples)) // prettier-ignore
 			: undefined;
-	return matcherOf(sprites, samples, (index) => blur(render(size, samples, index), samples, sigma), coarse); // prettier-ignore
+	// Photographic coarse samples must average the same rendered alpha and color as the
+	// full patch. A separately chosen mipmap can otherwise remove a guard's thin outline.
+	return matcherOf(sprites, samples, fullAt, coarse);
 }
 
 /** A matcher whose templates are built from their renders when first asked for. */
@@ -332,7 +396,24 @@ function matcherOf(
 	const template = (index: number): Template =>
 		(built[index] ??= buildTemplate(sprites[index], index, rendered(index), mask, glow));
 	const empty = buildTemplate(undefined, -1, new Float32Array(samples * samples * 4), mask, glow);
-	return { samples, mask, glow, count: sprites.length, template, empty, coarse };
+	const variants = new Map<string, number[]>();
+	sprites.forEach((sprite, index) => {
+		const code = sprite.piece.kind.code;
+		if (!variants.has(code)) variants.set(code, []);
+		variants.get(code)!.push(index);
+	});
+	const compared = mask.reduce((sum, kept) => sum + kept, 0);
+	return {
+		samples,
+		mask,
+		glow,
+		count: sprites.length,
+		variants,
+		compared,
+		template,
+		empty,
+		coarse,
+	};
 }
 
 /** Box-averages a square grid of values, area-weighted, down to fewer cells per side. */
@@ -507,6 +588,82 @@ export function meanColor(patch: Float32Array, mask: Uint8Array): RGB {
 	return [mean[0] / n, mean[1] / n, mean[2] / n];
 }
 
+/**
+ * Fit exposure gradients to the glyph-free perimeter, then predict the held-out interior.
+ * Moiré can make a bare tile busy, but its interior should remain consistent with this noise.
+ */
+export function photoBackground(patch: Float32Array, samples: number): PhotoBackground {
+	const known = PHOTO_BACKGROUNDS.get(patch);
+	if (known) return known;
+	const mean: RGB = [0, 0, 0],
+		dx: RGB = [0, 0, 0],
+		dy: RGB = [0, 0, 0];
+	let count = 0,
+		xx = 0,
+		yy = 0;
+	for (let y = 0; y < samples; y++)
+		for (let x = 0; x < samples; x++) {
+			if (x !== 0 && y !== 0 && x !== samples - 1 && y !== samples - 1) continue;
+			const u = (x + 0.5) / samples - 0.5;
+			const v = (y + 0.5) / samples - 0.5;
+			count++;
+			xx += u * u;
+			yy += v * v;
+			for (let c = 0; c < 3; c++) {
+				const color = patch[(y * samples + x) * 3 + c]!;
+				mean[c]! += color;
+				dx[c]! += u * color;
+				dy[c]! += v * color;
+			}
+		}
+	for (let c = 0; c < 3; c++) {
+		mean[c]! /= count;
+		dx[c]! /= xx;
+		dy[c]! /= yy;
+	}
+	let perimeter = 0,
+		interior = 0,
+		inside = 0;
+	const sideEnergy = [0, 0, 0, 0];
+	const sideSamples = [0, 0, 0, 0];
+	for (let y = 0; y < samples; y++)
+		for (let x = 0; x < samples; x++) {
+			const u = (x + 0.5) / samples - 0.5;
+			const v = (y + 0.5) / samples - 0.5;
+			let energy = 0;
+			for (let c = 0; c < 3; c++) {
+				const residual =
+					patch[(y * samples + x) * 3 + c]! - mean[c]! - u * dx[c]! - v * dy[c]!;
+				energy += residual * residual;
+			}
+			if (x !== 0 && y !== 0 && x !== samples - 1 && y !== samples - 1) {
+				interior += energy;
+				inside++;
+			} else {
+				perimeter += energy;
+				const side = y === 0 ? 0 : y === samples - 1 ? 2 : x === samples - 1 ? 1 : 3;
+				sideEnergy[side]! += energy;
+				sideSamples[side]!++;
+			}
+		}
+	const noise = perimeter / count;
+	let variation = 0;
+	for (let side = 0; side < 4; side++)
+		variation += (sideEnergy[side]! / sideSamples[side]! - noise) ** 2;
+	const background = { mean, dx, dy, noise, noiseUncertainty: Math.sqrt(variation / 12), interior: interior / inside }; // prettier-ignore
+	PHOTO_BACKGROUNDS.set(patch, background);
+	return background;
+}
+
+/**
+ * A held-out interior consistent with the independently observed perimeter needs no glyph fit.
+ * The small tolerance covers the plane's sampling uncertainty; ambiguous structure stays busy.
+ */
+export function isPhotographicBackground(patch: Float32Array, samples: number): boolean {
+	const background = photoBackground(patch, samples);
+	return background.interior <= 1.25 * Math.max(1e-6, background.noise);
+}
+
 /** Computes the patch-only sums of the template fits. */
 export function patchSums(matcher: Matcher, patch: Float32Array): PatchSums {
 	const sums: PatchSums = { sum: [0, 0, 0], glowSum: [0, 0, 0], energy: 0 };
@@ -526,15 +683,33 @@ export function patchSums(matcher: Matcher, patch: Float32Array): PatchSums {
 
 /** The fits of a patch's likeliest templates, best first, shortlisted on the coarse templates if any. */
 export function rankFits(matcher: Matcher, patch: Float32Array, sums: PatchSums): Fit[] {
+	const known = matcher.photographed && RANKED.get(matcher)?.get(patch);
+	if (known) return known;
 	let candidates = Array.from({ length: matcher.count }, (_, index) => index);
 	const { coarse } = matcher;
 	if (coarse) {
 		const small = resample(patch, matcher.samples, coarse.samples, 3);
 		const shortlist = rankFits(coarse, small, patchSums(coarse, small)).slice(0, matcher.photographed ? 2 * SHORTLIST : SHORTLIST); // prettier-ignore
 		candidates = shortlist.map((fit) => fit.template.index);
+		if (matcher.photographed) {
+			// Coarse samples can blur away black outlines that distinguish a player's tint.
+			// Compare every player of the leading shapes at full resolution before deciding hue.
+			const kinds = new Set<string>();
+			for (const fit of shortlist) {
+				kinds.add(fit.template.sprite!.piece.kind.code);
+			}
+			for (const kind of kinds)
+				for (const index of matcher.variants.get(kind)!)
+					if (!candidates.includes(index)) candidates.push(index);
+		}
 	}
 	const fits = candidates.map((index) => fitTemplate(matcher.template(index), matcher, patch, sums)); // prettier-ignore
-	return fits.sort((a, b) => a.residual - b.residual);
+	fits.sort((a, b) => a.residual - b.residual);
+	if (matcher.photographed) {
+		if (!RANKED.has(matcher)) RANKED.set(matcher, new WeakMap());
+		RANKED.get(matcher)!.set(patch, fits);
+	}
+	return fits;
 }
 
 /** Settles noisy photographic candidates on averaged patches, allowing slight corner-fit errors. */
@@ -543,18 +718,24 @@ export function refinePhotoFits(
 	patch: Float32Array,
 	sums: PatchSums,
 	ranked: Fit[],
+	wide = false,
 ): Fit[] {
+	const alignedCache = wide ? WIDE_ALIGNED : ALIGNED;
 	return ranked
-		.slice(0, 2 * SHORTLIST)
+		.slice(0, (wide ? 4 : 2) * SHORTLIST)
 		.map((fit) => {
 			const { template } = fit;
-			let shifted = ALIGNED.get(template);
+			let shifted = alignedCache.get(template);
 			if (!shifted) {
 				shifted = [];
 				const n = matcher.samples;
-				for (const dy of [-1, -0.5, 0, 0.5, 1]) {
-					for (const dx of [-1, -0.5, 0, 0.5, 1]) {
+				const offsets = wide
+					? [-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2]
+					: [-1, -0.5, 0, 0.5, 1];
+				for (const dy of offsets) {
+					for (const dx of offsets) {
 						if (dx === 0 && dy === 0) continue;
+						if (wide && Math.abs(dx) <= 1 && Math.abs(dy) <= 1) continue;
 						const rgba = new Float32Array(n * n * 4);
 						for (let y = 0; y < n; y++) {
 							for (let x = 0; x < n; x++) {
@@ -587,12 +768,12 @@ export function refinePhotoFits(
 						shifted.push(buildTemplate(template.sprite, template.index, rgba, matcher.mask, matcher.glow)); // prettier-ignore
 					}
 				}
-				ALIGNED.set(template, shifted);
+				alignedCache.set(template, shifted);
 			}
 			for (const aligned of shifted) {
 				const candidate = fitTemplate(aligned, matcher, patch, sums);
 				// Prefer the measured grid alignment unless moving the piece materially improves its fit.
-				candidate.residual += 0.002 * matcher.mask.reduce((sum, kept) => sum + kept, 0);
+				candidate.residual += 0.002 * matcher.compared;
 				if (candidate.residual < fit.residual) fit = candidate;
 			}
 			return fit;
@@ -648,9 +829,10 @@ export function fitTemplate(
 }
 
 /**
- * A photographed display's local affine response has one brightness gain and one gray black-level
- * offset. Both are shared by its RGB channels, preserving a colored player's hue. The square's
- * background and check glow are still independent RGB colors.
+ * A photographed display's local affine response has one brightness gain and RGB black-level
+ * offsets. A small bounded color cast models glare and camera white balance without allowing
+ * neutral pieces to absorb the much larger tint of a colored player. The background and check
+ * glow are still independent RGB colors.
  */
 function fitPhotographed(
 	template: Template,
@@ -664,26 +846,145 @@ function fitPhotographed(
 	m11: number,
 	det: number,
 ): Fit {
+	const limit = photographedCastLimit(patch, matcher.samples);
+	if (limit === 0)
+		return fitGrayPhotographed(template, matcher, patch, sums, aO, agO, OP, m00, m11, det);
+
 	const projectOut = (u: number, v: number, x: number, y: number): number =>
 		(m11 * u * x - template.uv * (u * y + v * x) + m00 * v * y) / det;
-	const ap = template.aP.reduce((a, b) => a + b, 0);
-	const ao = aO.reduce((a, b) => a + b, 0);
-	let pp = template.PP;
-	let pa = ap;
+	const terms = cameraTerms(template, m00, m11, det);
 	let po = OP;
-	let ay = ao;
-	const aa = 3 * (template.aa - projectOut(template.ua, template.va, template.ua, template.va));
+	const { pp, pa, aa } = terms;
+	const ay: RGB = [...aO];
 	for (let c = 0; c < 3; c++) {
 		const u = template.uP[c]!;
 		const v = template.vP[c]!;
 		const x = sums.sum[c]! - aO[c]!;
 		const y = sums.glowSum[c]! - agO[c]!;
-		pp -= projectOut(u, v, u, v);
-		pa -= projectOut(u, v, template.ua, template.va);
+		po -= projectOut(u, v, x, y);
+		ay[c]! -= projectOut(template.ua, template.va, x, y);
+	}
+
+	const { ridge } = terms;
+	const offsetEnergy = aa + ridge;
+	const gainEnergy = pp + ridge;
+	let projectedOffset = 0,
+		projectedGain = 0;
+	for (let c = 0; c < 3; c++) {
+		projectedOffset += (pa[c]! * ay[c]!) / offsetEnergy;
+		projectedGain += (pa[c]! * pa[c]!) / offsetEnergy;
+	}
+	let gain = (po + ridge - projectedOffset) / (gainEnergy - projectedGain);
+	const offset: RGB = [0, 0, 0];
+	for (let step = 0; step < 4; step++) {
+		gain = Math.max(0.2, Math.min(1.3, gain));
+		let gray = 0;
+		for (let c = 0; c < 3; c++) {
+			offset[c] = Math.max(-0.05, Math.min(0.55, (ay[c]! - pa[c]! * gain) / offsetEnergy));
+			gray += offset[c]!;
+		}
+		gray /= 3;
+		let projection = 0;
+		for (let c = 0; c < 3; c++) {
+			offset[c] = Math.max(gray - limit, Math.min(gray + limit, offset[c]!));
+			projection += pa[c]! * offset[c]!;
+		}
+		gain = Math.max(0.2, Math.min(1.3, (po + ridge - projection) / gainEnergy));
+	}
+	let residual = sums.energy - 2 * gain * OP + gain * gain * template.PP;
+	const glow: RGB = [0, 0, 0];
+	const background: RGB = [0, 0, 0];
+	for (let c = 0; c < 3; c++) {
+		residual += -2 * offset[c]! * aO[c]! + 2 * gain * offset[c]! * template.aP[c]! + offset[c]! * offset[c]! * template.aa; // prettier-ignore
+		const u = sums.sum[c]! - aO[c]! - gain * template.uP[c]! - offset[c]! * template.ua;
+		const v = sums.glowSum[c]! - agO[c]! - gain * template.vP[c]! - offset[c]! * template.va;
+		const base = (m11 * u - template.uv * v) / det;
+		background[c] = base;
+		glow[c] = (m00 * v - template.uv * u) / det;
+		residual -= base * u + glow[c]! * v;
+	}
+	// A weak camera prior breaks noisy ties without letting an almost gray, saturated piece
+	// impersonate another player's sprite through an extreme response at both bounds.
+	let offsetPrior = 0;
+	for (let c = 0; c < 3; c++) offsetPrior += (offset[c]! - 0.08) ** 2;
+	residual += 0.02 * template.aa * ((gain - 0.8) ** 2 + offsetPrior / 3);
+	const response = { gain, offset };
+	const castFit = new PhotographedFit(
+		template,
+		matcher,
+		patch,
+		residual,
+		glow,
+		response,
+		background,
+	);
+	// The bounded RGB solve may converge slowly when gain and black level are nearly
+	// interchangeable. Its extra freedom must never lose a better hue-preserving fit.
+	const grayFit = fitGrayPhotographed(template, matcher, patch, sums, aO, agO, OP, m00, m11, det);
+	return grayFit.residual < castFit.residual ? grayFit : castFit;
+}
+
+/** The tile perimeter limits how much local color cast can vary between player candidates. */
+function photographedCastLimit(patch: Float32Array, samples: number): number {
+	const known = CAMERA_CAST_LIMITS.get(patch);
+	if (known !== undefined) return known;
+	const mean: RGB = [0, 0, 0];
+	let count = 0;
+	for (let y = 0; y < samples; y++)
+		for (let x = 0; x < samples; x++) {
+			if (x !== 0 && y !== 0 && x !== samples - 1 && y !== samples - 1) continue;
+			count++;
+			for (let c = 0; c < 3; c++) mean[c]! += patch[(y * samples + x) * 3 + c]!;
+		}
+	const chroma = (Math.max(...mean) - Math.min(...mean)) / count;
+	let redNoise = 0,
+		blueNoise = 0;
+	for (let y = 0; y < samples; y++)
+		for (let x = 0; x < samples; x++) {
+			if (x !== 0 && y !== 0 && x !== samples - 1 && y !== samples - 1) continue;
+			const at = (y * samples + x) * 3;
+			redNoise += (patch[at]! - patch[at + 1]! - (mean[0] - mean[1]) / count) ** 2;
+			blueNoise += (patch[at + 2]! - patch[at + 1]! - (mean[2] - mean[1]) / count) ** 2;
+		}
+	// Colored display stripes can cancel in the perimeter mean while biasing the glyph's
+	// local white balance. Their independent chromatic variation bounds this extra cast.
+	const colorNoise = Math.sqrt(Math.max(redNoise, blueNoise) / count);
+	const maximum = 0.06 + 0.08 * Math.max(0, Math.min(1, (chroma - 0.4) / 0.4));
+	const limit = Math.max(0, Math.min(maximum, Math.max((chroma - 0.12) * 0.75, 3.2 * (colorNoise - 0.015)))); // prettier-ignore
+	CAMERA_CAST_LIMITS.set(patch, limit);
+	return limit;
+}
+
+/** Gray display backgrounds constrain the camera to a common black level across channels. */
+function fitGrayPhotographed(
+	template: Template,
+	matcher: Matcher,
+	patch: Float32Array,
+	sums: PatchSums,
+	aO: RGB,
+	agO: RGB,
+	OP: number,
+	m00: number,
+	m11: number,
+	det: number,
+): Fit {
+	const projectOut = (u: number, v: number, x: number, y: number): number =>
+		(m11 * u * x - template.uv * (u * y + v * x) + m00 * v * y) / det;
+	const terms = cameraTerms(template, m00, m11, det);
+	const { ap, pp, ridge } = terms;
+	const ao = aO.reduce((a, b) => a + b, 0);
+	const pa = terms.grayPA;
+	let po = OP;
+	let ay = ao;
+	const aa = terms.grayAA;
+	for (let c = 0; c < 3; c++) {
+		const u = template.uP[c]!;
+		const v = template.vP[c]!;
+		const x = sums.sum[c]! - aO[c]!;
+		const y = sums.glowSum[c]! - agO[c]!;
 		po -= projectOut(u, v, x, y);
 		ay -= projectOut(template.ua, template.va, x, y);
 	}
-	const ridge = 0.002 * (template.aa + 1);
 	const d = (pp + ridge) * (aa + ridge) - pa * pa;
 	let gain = ((aa + ridge) * (po + ridge) - pa * ay) / d;
 	let offset = ((pp + ridge) * ay - pa * (po + ridge)) / d;
@@ -708,21 +1009,77 @@ function fitPhotographed(
 	// impersonate another player's sprite through an extreme response at both bounds.
 	residual += 0.02 * template.aa * ((gain - 0.8) ** 2 + (offset - 0.08) ** 2);
 	const response = { gain, offset: [offset, offset, offset] as RGB };
-	let noise = 0;
-	let bare = 0;
-	for (let p = 0; p < matcher.mask.length; p++) {
-		if (!matcher.mask[p] || template.alpha[p]! > 0.05) continue;
-		for (let c = 0; c < 3; c++) {
-			const predicted = gain * template.color[p * 3 + c]! + offset * template.alpha[p]! + (1 - template.alpha[p]!) * (background[c]! + glow[c]! * matcher.glow[p]!); // prettier-ignore
-			noise += (patch[p * 3 + c]! - predicted) ** 2;
-		}
-		bare++;
+	return new PhotographedFit(template, matcher, patch, residual, glow, response, background);
+}
+
+/** The camera solve's Schur complement contains no patch data and need only be built once. */
+interface CameraTerms {
+	pp: number;
+	pa: RGB;
+	aa: number;
+	ap: number;
+	grayPA: number;
+	grayAA: number;
+	ridge: number;
+}
+
+function cameraTerms(template: Template, m00: number, m11: number, det: number): CameraTerms {
+	const known = CAMERA_TERMS.get(template);
+	if (known) return known;
+	const projectOut = (u: number, v: number, x: number, y: number): number =>
+		(m11 * u * x - template.uv * (u * y + v * x) + m00 * v * y) / det;
+	const aa = template.aa - projectOut(template.ua, template.va, template.ua, template.va);
+	const ap = template.aP.reduce((a, b) => a + b, 0);
+	const pa: RGB = [...template.aP];
+	let pp = template.PP;
+	let grayPA = ap;
+	for (let c = 0; c < 3; c++) {
+		const u = template.uP[c]!;
+		const v = template.vP[c]!;
+		pp -= projectOut(u, v, u, v);
+		const projectedAlpha = projectOut(u, v, template.ua, template.va);
+		pa[c]! -= projectedAlpha;
+		grayPA -= projectedAlpha;
 	}
-	return {
-		template,
-		residual: Math.max(residual, 0),
-		glow,
-		response,
-		noise: bare ? noise / bare : 0,
-	};
+	const terms = { pp, pa, aa, ap, grayPA, grayAA: 3 * aa, ridge: 0.002 * (template.aa + 1) };
+	CAMERA_TERMS.set(template, terms);
+	return terms;
+}
+
+/** Computes background noise only for a finalist, leaving discarded template fits inexpensive. */
+class PhotographedFit implements Fit {
+	residual: number;
+	private measuredNoise: number | undefined;
+
+	constructor(
+		readonly template: Template,
+		private readonly matcher: Matcher,
+		private readonly patch: Float32Array,
+		residual: number,
+		readonly glow: RGB,
+		readonly response: CameraResponse,
+		private readonly background: RGB,
+	) {
+		this.residual = Math.max(residual, 0);
+	}
+
+	// The prototype shares this getter across the thousands of discarded photographic fits.
+	get noise(): number {
+		if (this.measuredNoise !== undefined) return this.measuredNoise;
+		const { template, matcher, patch, response, background, glow } = this;
+		let total = 0,
+			bare = 0;
+		for (let p = 0; p < matcher.mask.length; p++) {
+			if (!matcher.mask[p] || template.alpha[p]! > 0.05) continue;
+			for (let c = 0; c < 3; c++) {
+				const predicted =
+					response.gain * template.color[p * 3 + c]! +
+					response.offset[c]! * template.alpha[p]! +
+					(1 - template.alpha[p]!) * (background[c]! + glow[c]! * matcher.glow[p]!);
+				total += (patch[p * 3 + c]! - predicted) ** 2;
+			}
+			bare++;
+		}
+		return (this.measuredNoise = bare ? total / bare : 0);
+	}
 }

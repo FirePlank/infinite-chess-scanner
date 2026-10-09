@@ -42,6 +42,13 @@ const BIN_COUNT = 1 << 18;
  * @throws If there's no checkerboard.
  */
 export function findTileColors(pic: Picture): Tiles {
+	// Exact pixel votes describe screenshots well, but repeated display stripes are a different
+	// sampling process. Detect them before allocating and tallying a full-resolution histogram.
+	// An averaged palette still needs repeated checkerboard evidence before camera processing wins.
+	if (hasDisplayNoise(pic)) {
+		const averaged = averagedTileColors(pic);
+		if (averaged) return averaged;
+	}
 	const { width, height } = pic;
 	const bins = new Uint32Array(width * height);
 	for (let i = 0; i < bins.length; i++) bins[i] = binOf(pic.rgb, i);
@@ -57,17 +64,11 @@ export function findTileColors(pic: Picture): Tiles {
 	}
 	if (best === undefined) throw new Error('No checkerboard with readable squares found in the image.'); // prettier-ignore
 	const tiles = meansOfBins(pic, bins, Math.floor(best / BIN_COUNT), best % BIN_COUNT);
-	// A photographed display has repeated subpixel stripes of its own. Their tiny contrast can
-	// win exact-color votes, so average over the stripes before looking for the board's colors.
-	if (colorDistance(tiles[0], tiles[1]) < 0.15 && hasDisplayNoise(pic)) {
-		const averaged = averagedTileColors(pic);
-		if (averaged) return averaged;
-	}
 	tiles.sort((a, b) => luminance(a) - luminance(b));
 	return [tiles[0], tiles[1]];
 }
 
-/** Flat screenshot areas repeat exact pixels; a camera's display stripes vary almost everywhere. */
+/** A camera's repeated display stripes vary where flat screenshot areas repeat exact pixels. */
 function hasDisplayNoise(pic: Picture): boolean {
 	let same = 0;
 	let total = 0;
@@ -76,48 +77,106 @@ function hasDisplayNoise(pic: Picture): boolean {
 		total++;
 		if (pic.rgb[i * 3] === pic.rgb[(i + 1) * 3] && pic.rgb[i * 3 + 1] === pic.rgb[(i + 1) * 3 + 1] && pic.rgb[i * 3 + 2] === pic.rgb[(i + 1) * 3 + 2]) same++; // prettier-ignore
 	}
-	return same < 0.35 * total;
+	if (same >= 0.35 * total) return false;
+	// Resampling and JPEG compression also destroy exact equality. Their edges grow farther apart
+	// over the first few pixels; display stripes repeat, so their difference falls again. Check both
+	// axes because the camera may be turned. A substantial fall avoids noise from finite sampling.
+	const { width, height, rgb } = pic;
+	for (const step of [1, width]) {
+		let previous = 0;
+		for (let offset = 1; offset <= 4; offset++) {
+			let energy = 0;
+			let samples = 0;
+			for (let i = 0; i < width * height; i += 23) {
+				if (step === 1 ? i % width + offset >= width : i + offset * width >= width * height) continue; // prettier-ignore
+				const a = i * 3;
+				const b = (i + offset * step) * 3;
+				const r = rgb[a]! - rgb[b]!;
+				const g = rgb[a + 1]! - rgb[b + 1]!;
+				const blue = rgb[a + 2]! - rgb[b + 2]!;
+				energy += r * r + g * g + blue * blue;
+				samples++;
+			}
+			energy /= samples;
+			if (previous > 0.0001 && energy < 0.9 * previous) return true;
+			previous = energy;
+		}
+	}
+	return false;
 }
 
 /** Checkerboard color votes from small averaged patches, at both axis and diagonal corners. */
 function averagedTileColors(pic: Picture): Tiles | undefined {
-	const votes = new Map<number, { count: number; sums: number[]; reaches: Set<number> }>();
+	const narrow = averagedPalette(pic, 2, [4, 7]);
+	const wide = averagedPalette(pic, 4, [12, 18]);
+	// Wider patches remove stripes that still dominate small patches, and clear text strokes.
+	// Count support relative to the area around a corner covered by each stencil. Keep a proven
+	// narrow palette when the wider stencil agrees, so glare does not unnecessarily shift it.
+	let best = narrow;
+	if (wide && (!narrow || (wide.score > narrow.score && differentPalette(narrow.tiles, wide.tiles)))) best = wide; // prettier-ignore
+	return best?.tiles;
+}
+
+/** Glare moves a palette along its existing contrast direction; a different theme changes it. */
+function differentPalette(narrow: Tiles, wide: Tiles): boolean {
+	const a: RGB = [narrow[1][0] - narrow[0][0], narrow[1][1] - narrow[0][1], narrow[1][2] - narrow[0][2]]; // prettier-ignore
+	const b: RGB = [wide[1][0] - wide[0][0], wide[1][1] - wide[0][1], wide[1][2] - wide[0][2]]; // prettier-ignore
+	const lengthA = Math.hypot(...a);
+	const lengthB = Math.hypot(...b);
+	const agreement = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (lengthA * lengthB);
+	return agreement < 0.95 || lengthB > 1.5 * lengthA;
+}
+
+/** A palette from one patch size, requiring repeated checkerboard evidence at both reaches. */
+function averagedPalette(
+	pic: Picture,
+	radius: number,
+	reaches: readonly [number, number],
+): { tiles: Tiles; score: number } | undefined {
+	const votes = new Map<
+		number,
+		{ count: number; sums: number[]; firstReach: number; secondReach: number }
+	>();
 	const { width, height, sat } = pic;
 	const stride = (width + 1) * 3;
-	const mean = (x: number, y: number): RGB => {
-		const a = (y - 2) * stride + (x - 2) * 3;
-		const b = a + 15;
-		const c = a + 5 * stride;
-		const d = c + 15;
-		return [0, 1, 2].map((channel) => (sat[d + channel]! - sat[b + channel]! - sat[c + channel]! + sat[a + channel]!) / 25) as RGB; // prettier-ignore
+	const side = radius * 2 + 1;
+	const area = side * side;
+	const colors = new Float64Array(12);
+	const mean = (x: number, y: number, offset: number): void => {
+		const a = (y - radius) * stride + (x - radius) * 3;
+		const b = a + side * 3;
+		const c = a + side * stride;
+		const d = c + side * 3;
+		colors[offset] = (sat[d]! - sat[b]! - sat[c]! + sat[a]!) / area;
+		colors[offset + 1] = (sat[d + 1]! - sat[b + 1]! - sat[c + 1]! + sat[a + 1]!) / area; // prettier-ignore
+		colors[offset + 2] = (sat[d + 2]! - sat[b + 2]! - sat[c + 2]! + sat[a + 2]!) / area; // prettier-ignore
 	};
 	const bin = (color: RGB): number => color.reduce((n, value) => n * 16 + Math.min(15, Math.floor(value * 16)), 0); // prettier-ignore
-	for (const reach of [4, 7]) {
+	const distanceSq = (a: number, b: number): number => (colors[a]! - colors[b]!) ** 2 + (colors[a + 1]! - colors[b + 1]!) ** 2 + (colors[a + 2]! - colors[b + 2]!) ** 2; // prettier-ignore
+	for (const reach of reaches) {
 		for (const diagonal of [true, false]) {
-			for (let y = reach + 2; y < height - reach - 2; y += 2) {
-				for (let x = reach + 2; x < width - reach - 2; x += 2) {
-					const colors = diagonal
-						? [
-								mean(x - reach, y - reach),
-								mean(x + reach, y - reach),
-								mean(x + reach, y + reach),
-								mean(x - reach, y + reach),
-							]
-						: [
-								mean(x - reach, y),
-								mean(x, y - reach),
-								mean(x + reach, y),
-								mean(x, y + reach),
-							];
-					const [a, b, c, d] = colors as [RGB, RGB, RGB, RGB];
-					if (colorDistance(a, c) > 0.06 || colorDistance(b, d) > 0.06 || colorDistance(a, b) < 0.15) continue; // prettier-ignore
-					let first = a.map((value, channel) => (value + c[channel]!) / 2) as RGB;
-					let second = b.map((value, channel) => (value + d[channel]!) / 2) as RGB;
+			for (let y = reach + radius; y < height - reach - radius; y += 2) {
+				for (let x = reach + radius; x < width - reach - radius; x += 2) {
+					if (diagonal) {
+						mean(x - reach, y - reach, 0);
+						mean(x + reach, y - reach, 3);
+						mean(x + reach, y + reach, 6);
+						mean(x - reach, y + reach, 9);
+					} else {
+						mean(x - reach, y, 0);
+						mean(x, y - reach, 3);
+						mean(x + reach, y, 6);
+						mean(x, y + reach, 9);
+					}
+					if (distanceSq(0, 6) > 0.06 ** 2 || distanceSq(3, 9) > 0.06 ** 2 || distanceSq(0, 3) < 0.15 ** 2) continue; // prettier-ignore
+					let first: RGB = [(colors[0]! + colors[6]!) / 2, (colors[1]! + colors[7]!) / 2, (colors[2]! + colors[8]!) / 2]; // prettier-ignore
+					let second: RGB = [(colors[3]! + colors[9]!) / 2, (colors[4]! + colors[10]!) / 2, (colors[5]! + colors[11]!) / 2]; // prettier-ignore
 					if (luminance(first) > luminance(second)) [first, second] = [second, first];
 					const key = bin(first) * 4096 + bin(second);
-					const vote = votes.get(key) ?? { count: 0, sums: [0, 0, 0, 0, 0, 0], reaches: new Set<number>() }; // prettier-ignore
+					const vote = votes.get(key) ?? { count: 0, sums: [0, 0, 0, 0, 0, 0], firstReach: 0, secondReach: 0 }; // prettier-ignore
 					vote.count++;
-					vote.reaches.add(reach);
+					if (reach === reaches[0]) vote.firstReach++;
+					else vote.secondReach++;
 					for (let channel = 0; channel < 3; channel++) {
 						vote.sums[channel]! += first[channel]!;
 						vote.sums[channel + 3]! += second[channel]!;
@@ -127,13 +186,16 @@ function averagedTileColors(pic: Picture): Tiles | undefined {
 			}
 		}
 	}
-	const best = [...votes.values()].sort((a, b) => b.count - a.count)[0];
 	// Small repeating obstacles can alternate at one reach. The same tile colors must meet at
-	// both reaches to distinguish broad checkerboard squares from those repeated marks.
-	if (!best || best.count < 12 || best.reaches.size < 2) return undefined;
+	// both reaches repeatedly to distinguish broad checkerboard squares from those repeated marks.
+	// Discard those marks before ranking: their stronger votes must not hide a real board pair.
+	const best = [...votes.values()]
+		.filter((vote) => vote.count >= 12 && vote.firstReach >= 3 && vote.secondReach >= 3)
+		.sort((a, b) => b.count - a.count)[0];
+	if (!best) return undefined;
 	const tiles: Tiles = [best.sums.slice(0, 3).map((value) => value / best.count) as RGB, best.sums.slice(3).map((value) => value / best.count) as RGB]; // prettier-ignore
 	tiles.photographed = true;
-	return tiles;
+	return { tiles, score: best.count / ((reaches[0] - radius) ** 2 + (reaches[1] - radius) ** 2) };
 }
 
 /** Tallies the color bin pairs meeting at checkerboard corners, read a reach away from each. */
@@ -213,10 +275,16 @@ export function tileShades(pic: Picture, tiles: Tiles): Float32Array {
 		if (tiles.photographed) {
 			const x = i % pic.width;
 			const y = (i - x) / pic.width;
-			const [x0, y0, x1, y1] = [Math.max(0, x - 3), Math.max(0, y - 3), Math.min(pic.width, x + 4), Math.min(pic.height, y + 4)]; // prettier-ignore
+			const x0 = Math.max(0, x - 3);
+			const y0 = Math.max(0, y - 3);
+			const x1 = Math.min(pic.width, x + 4);
+			const y1 = Math.min(pic.height, y + 4);
 			const stride = pic.width + 1;
 			const area = (x1 - x0) * (y1 - y0);
-			const [a, d, c, e] = [(y1 * stride + x1) * 3, (y0 * stride + x1) * 3, (y1 * stride + x0) * 3, (y0 * stride + x0) * 3]; // prettier-ignore
+			const a = (y1 * stride + x1) * 3;
+			const d = (y0 * stride + x1) * 3;
+			const c = (y1 * stride + x0) * 3;
+			const e = (y0 * stride + x0) * 3;
 			r = (pic.sat[a]! - pic.sat[d]! - pic.sat[c]! + pic.sat[e]!) / area - dark[0];
 			g = (pic.sat[a + 1]! - pic.sat[d + 1]! - pic.sat[c + 1]! + pic.sat[e + 1]!) / area - dark[1]; // prettier-ignore
 			b = (pic.sat[a + 2]! - pic.sat[d + 2]! - pic.sat[c + 2]! + pic.sat[e + 2]!) / area - dark[2]; // prettier-ignore

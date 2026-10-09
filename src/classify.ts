@@ -17,8 +17,10 @@ import {
 	fitTemplate,
 	glowAt,
 	innerMask,
+	isPhotographicBackground,
 	isPlain,
 	patchSums,
+	photoBackground,
 	rankFits,
 	refinePhotoFits,
 } from './matcher.js';
@@ -35,6 +37,8 @@ export interface Reader {
 	tiles: Tiles;
 	/** Whether a square neither a piece nor the background explains reads as covered. */
 	detectsCovers: boolean;
+	/** Cells inferred across a small gap, whose interiors must independently prove visible structure. */
+	inferred?: ReadonlySet<string>;
 }
 
 /** The screen pixels a square is compared over at pixel level, and where each falls in it. */
@@ -82,14 +86,47 @@ export function classify(
 	const { tiles } = reader;
 	if (patch === undefined || isPlain(patch, innerMask(sizeClass.samples))) return backgroundVerdict(mean, tiles); // prettier-ignore
 	const matcher = matchers(sizeClass);
+	if (matcher.photographed && reader.inferred?.has(`${square.column},${square.row}`)) {
+		const background = photoBackground(patch, matcher.samples);
+		// A conservative small-sample margin on four side blocks avoids assuming every
+		// camera pixel independent; the blocks themselves can remain correlated.
+		if (background.interior <= background.noise + 4.6 * background.noiseUncertainty)
+			return { kind: 'obscured' };
+	}
+	if (matcher.photographed && isPhotographicBackground(patch, matcher.samples))
+		return backgroundVerdict(mean, tiles);
 
 	const sums = patchSums(matcher, patch);
 	let ranked = rankFits(matcher, patch, sums);
-	if (matcher.photographed) {
-		ranked = refinePhotoFits(matcher, patch, sums, ranked);
-	}
 	const background = fitTemplate(matcher.empty, matcher, patch, sums);
-	const samples = matcher.mask.reduce((sum, kept) => sum + kept, 0);
+	if (matcher.photographed) {
+		// Display stripes make bare tiles busy. A clean background fit that decisively beats
+		// every glyph needs no expensive search over shifted photographic templates.
+		if (
+			ranked[0]!.residual >= 2 * background.residual &&
+			background.residual <= 0.01 * matcher.compared
+		)
+			return backgroundVerdict(mean, tiles);
+		const unaligned = ranked;
+		ranked = refinePhotoFits(matcher, patch, sums, unaligned);
+		const noise = ranked[0]!.noise ?? 0;
+		// An unexplained shape beside independently measured tile corners can need a wider
+		// correction for local grid drift when one sample spans less than two camera pixels.
+		// It must already fit near the bare background, and improve materially after shifting.
+		if (
+			square.size < 2 * matcher.samples &&
+			ranked[0]!.residual > PIECE_FIT_RATIO * background.residual &&
+			ranked[0]!.residual <= 1.05 * background.residual &&
+			noise <= 0.03 &&
+			background.residual > 1.3 * noise * matcher.compared &&
+			hasMeasuredCorners(reader.view, square)
+		) {
+			const wider = refinePhotoFits(matcher, patch, sums, unaligned, true);
+			if (wider[0]!.residual < 0.8 * ranked[0]!.residual)
+				ranked = [...ranked, ...wider].sort((a, b) => a.residual - b.residual);
+		}
+	}
+	const samples = matcher.compared;
 	const unexplained = matcher.photographed
 		? 0.06 + 2 * Math.min(0.03, ranked[0]!.noise ?? 0)
 		: 0.04;
@@ -101,7 +138,13 @@ export function classify(
 	) {
 		return { kind: 'obscured' };
 	}
-	if (ranked[0]!.residual > PIECE_FIT_RATIO * background.residual)
+	// Noise on a photographed bare tile remains even when its glyph fits exactly. Discount
+	// that shared error, bounded so a poor glyph fit still needs visible shape evidence.
+	const sharedNoise =
+		matcher.photographed && (ranked[0]!.noise ?? 0) <= 0.03
+			? Math.min(0.2 * background.residual, (ranked[0]!.noise ?? 0) * samples)
+			: 0;
+	if (ranked[0]!.residual - sharedNoise > PIECE_FIT_RATIO * (background.residual - sharedNoise))
 		return backgroundVerdict(mean, tiles);
 	const finalists = ranked
 		.filter(
@@ -118,8 +161,27 @@ export function classify(
 
 	const piece = best.template.sprite!.piece;
 	const royal = royalCounterpart(piece);
-	const inCheck = best.glow[0] - (best.glow[1] + best.glow[2]) / 2 > CHECK_GLOW_REDNESS;
+	// A camera's stripes can make the least-squares glow faintly red. Its uncertainty comes
+	// from the independently measured bare-tile noise and the radial background basis.
+	const { uu, uv, vv } = best.template;
+	const ridge = 1e-3 * (uu + 1);
+	const glowVariance = matcher.photographed
+		? (0.5 * (best.noise ?? 0) * (uu + ridge)) / ((uu + ridge) * (vv + ridge) - uv * uv)
+		: 0;
+	const inCheck = best.glow[0] - (best.glow[1] + best.glow[2]) / 2 > CHECK_GLOW_REDNESS + 2 * Math.sqrt(glowVariance); // prettier-ignore
 	return { kind: 'piece', piece: royal !== undefined && inCheck ? royal : piece };
+}
+
+/** At least three directly seen tile crossings support a wider local glyph correction. */
+function hasMeasuredCorners(view: View, { column, row }: Square): boolean {
+	return (
+		[
+			`${column},${row}`,
+			`${column + 1},${row}`,
+			`${column},${row + 1}`,
+			`${column + 1},${row + 1}`,
+		].filter((key) => view.measuredCornerSupport?.has(key)).length >= 3
+	);
 }
 
 /** A pieceless square is a void when it's clearly darker than even the dark tiles. */

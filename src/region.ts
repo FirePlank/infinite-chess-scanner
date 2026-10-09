@@ -30,6 +30,9 @@ interface Surface {
 	cornerEvidence: [number, number];
 	/** Interior luminance range, with photographic display noise outliers removed. */
 	variation: number;
+	/** Coarsely averaged center, separating sky from a photographed display's pixel stripes. */
+	skyBackground: RGB;
+	skyVariation: number;
 	/** A uniformly dark square can be a void, or sky beyond the world border. */
 	void: boolean;
 }
@@ -40,7 +43,9 @@ export interface BoardRegion {
 	squares: Square[];
 	/** Interior cells whose glyph or highlight hides the tile perimeter. */
 	candidates: Square[];
-	/** Number of directly supported orthogonal neighbors of an interior candidate. */
+	/** Bounded holes supported by their neighbors, requiring independent interior structure. */
+	inferred?: ReadonlySet<string>;
+	/** Number of orthogonal neighbors supported by tiles, sky, or the repeated island structure. */
 	neighbors: Map<string, number>;
 	/** Uniform dark squares outside the tile extent, which can establish a world border. */
 	beyond: Square[];
@@ -96,15 +101,87 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 	for (const { square, tiles: evidence } of surfaces) {
 		votes += (evidence[0] - evidence[1]) * (parity(square) === 0 ? 1 : -1);
 	}
-	const darkParity = votes >= 0 ? 0 : 1;
+	let darkParity: 0 | 1 = votes >= 0 ? 0 : 1;
 	const index = new Map(surfaces.map((surface) => [key(surface.square), surface]));
 	const initialEvidence = new Map(
 		surfaces.map((surface) => [key(surface.square), surface.tiles]),
 	);
+	let gaps = new Set<string>();
+	let crowdedPalette = false;
 	if (tiles.photographed) {
+		const measuredTiles = new Set(
+			surfaces
+				.filter(
+					({ square }) =>
+						view.measuredCornerSupport &&
+						squareCorners(square).filter((k) => view.measuredCornerSupport!.has(k))
+							.length >= 3,
+				)
+				.map(({ square }) => key(square)),
+		);
+		const locallyTiled = (square: Square): boolean => measuredTiles.has(key(square));
+		// Repeated marks can dominate the global palette. The measured tile crossings still
+		// determine which parity is darker from neighboring perimeter colors.
+		let localVotes = 0;
+		let comparisons = 0;
+		for (const surface of surfaces) {
+			if (!locallyTiled(surface.square) || surface.void) continue;
+			for (const k of neighbors(surface.square)) {
+				const neighbor = index.get(k);
+				if (!neighbor || neighbor.void || !locallyTiled(neighbor.square)) continue;
+				localVotes +=
+					(luminance(neighbor.background) - luminance(surface.background)) *
+					(parity(surface.square) === 0 ? 1 : -1);
+				comparisons++;
+			}
+		}
+		const localParity = localVotes >= 0 ? 0 : 1;
+		const observed: [RGB[], RGB[]] = [[], []];
+		for (const surface of surfaces) {
+			if (locallyTiled(surface.square) && !surface.void)
+				observed[parity(surface.square) === localParity ? 0 : 1].push(surface.background);
+		}
+		if (
+			comparisons >= 16 &&
+			Math.abs(localVotes) > 0.5 &&
+			observed.every((colors) => colors.length >= 8)
+		) {
+			const recovered = observed.map(medianColor) as [RGB, RGB];
+			crowdedPalette =
+				colorDistance(recovered[0], tiles[0]) > 0.2 &&
+				colorDistance(recovered[1], tiles[1]) < 0.15;
+			if (crowdedPalette) darkParity = localParity;
+		}
+		const initialTiles = new Set(surfaces.filter((s) =>
+			!s.void && (s.tiles[parity(s.square) === darkParity ? 0 : 1] > 0.3 || locallyTiled(s.square)),
+		).map((s) => key(s.square))); // prettier-ignore
+		gaps = findVoidLanes(surfaces, initialTiles);
 		// Camera exposure can weaken a gray theme's contrast. Compare the local pair with the
 		// recovered theme while keeping enough separation to reject a uniform foreground.
-		const minimumContrast = Math.max(0.05, Math.min(0.08, 0.5 * (luminance(tiles[1]) - luminance(tiles[0])))); // prettier-ignore
+		const minimumContrast = crowdedPalette ? 0.035 : Math.max(0.05, Math.min(0.08, 0.5 * (luminance(tiles[1]) - luminance(tiles[0])))); // prettier-ignore
+		const localSeeds = new Set(
+			surfaces
+				.filter(
+					(neighbor) =>
+						!neighbor.void &&
+						(gaps.size > 0 ||
+							locallyTiled(neighbor.square) ||
+							((!crowdedPalette ||
+								initialEvidence.get(key(neighbor.square))![
+									parity(neighbor.square) === darkParity ? 0 : 1
+								] > 0.3) &&
+								neighbors(neighbor.square).some((k) => {
+									const opposite = index.get(k);
+									return (
+										opposite &&
+										initialEvidence.get(k)![
+											parity(opposite.square) === darkParity ? 0 : 1
+										] > 0.3
+									);
+								}))),
+				)
+				.map(({ square }) => key(square)),
+		);
 		for (const surface of surfaces) {
 			const nearby: [RGB[], RGB[]] = [[], []];
 			for (let dr = -3; dr <= 3; dr++) {
@@ -112,19 +189,7 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 					const neighbor = index.get(
 						`${surface.square.column + dc},${surface.square.row + dr}`,
 					);
-					if (
-						neighbor &&
-						!neighbor.void &&
-						neighbors(neighbor.square).some((k) => {
-							const opposite = index.get(k);
-							return (
-								opposite &&
-								initialEvidence.get(k)![
-									parity(opposite.square) === darkParity ? 0 : 1
-								] > 0.3
-							);
-						})
-					)
+					if (neighbor && localSeeds.has(key(neighbor.square)))
 						nearby[parity(neighbor.square) === darkParity ? 0 : 1].push(
 							neighbor.background,
 						);
@@ -133,8 +198,9 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 			if (nearby.some((group) => group.length < 3)) continue;
 			const local: Tiles = [medianColor(nearby[0]), medianColor(nearby[1])];
 			if (
-				luminance(local[1]) - luminance(local[0]) < minimumContrast ||
-				luminance(local[0]) < luminance(tiles[0]) - 0.18
+				luminance(local[1]) - luminance(local[0]) <
+					(gaps.size > 0 ? 0.04 : minimumContrast) ||
+				(gaps.size === 0 && luminance(local[0]) < luminance(tiles[0]) - 0.18)
 			) {
 				surface.tiles = [0, 0];
 				continue;
@@ -154,9 +220,37 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 			)
 			.map((s) => key(s.square)),
 	);
+	if (tiles.photographed) for (const k of findVoidLanes(surfaces, tileSupported)) gaps.add(k);
+	// A flat foreground can cover adjacent tile and sky interiors while leaving their edges.
+	// Matching center colors across that boundary, unlike either exposed perimeter, reveal it.
+	const foreground = new Set(
+		tiles.photographed
+			? surfaces
+					.filter(
+						(s) =>
+							s.skyVariation < 0.14 &&
+							colorDistance(s.skyBackground, s.background) > 0.12 &&
+							neighbors(s.square).some((k) => {
+								const neighbor = index.get(k);
+								return (
+									neighbor &&
+									!neighbor.void &&
+									Math.max(...neighbor.tiles) < 0.1 &&
+									neighbor.skyVariation < 0.14 &&
+									colorDistance(s.skyBackground, neighbor.skyBackground) <
+										0.035 &&
+									colorDistance(neighbor.skyBackground, neighbor.background) >
+										0.08
+								);
+							}),
+					)
+					.map((s) => key(s.square))
+			: [],
+	);
 	const supported = new Set(
 		surfaces
 			.filter((s) => {
+				if (foreground.has(key(s.square))) return false;
 				const side = parity(s.square) === darkParity ? 0 : 1;
 				const nearUi = neighbors(s.square).some(
 					(k) => index.has(k) && !tileSupported.has(k) && !index.get(k)!.void,
@@ -168,7 +262,9 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 					tiles.photographed &&
 					nearUi &&
 					s.variation >= 0.14 &&
-					(s.sides[side] < 0.4 || s.cornerEvidence[side] < 3)
+					(s.sides[side] < 0.4 ||
+						(s.cornerEvidence[side] < 3 &&
+							!(s.sides[side] >= 0.6 && s.cornerEvidence[side] >= 2)))
 				)
 					return false;
 				return (
@@ -181,11 +277,31 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 			})
 			.map(({ square }) => key(square)),
 	);
+	// The corner detector need not observe every crossing under smoothly varying camera light.
+	// Four independently exposed tile perimeters also establish a crossing: opposite quadrants
+	// must agree and adjacent quadrants must alternate. Only surfaces that have passed the
+	// foreground checks can contribute, so rejected evidence cannot propagate to another cell.
+	const surfaceCorners = tiles.photographed
+		? inferredSurfaceCorners(surfaces, index, supported, darkParity)
+		: new Set<string>();
+	const cornerSupport = view.cornerSupport && new Set([...view.cornerSupport, ...surfaceCorners]);
 	// A menu can share the light tiles' color. Its missing alternating neighbors distinguish it
 	// from a board, even when it covers only empty squares.
 	const tiled = surfaces.filter(({ square }) => {
 		if (!supported.has(key(square))) return false;
-		return neighbors(square).filter((k) => supported.has(k)).length >= 2;
+		const adjacent = neighbors(square);
+		const count = adjacent.filter((k) => supported.has(k)).length;
+		if (count >= 2) return true;
+		const surface = index.get(key(square))!;
+		const side = parity(square) === darkParity ? 0 : 1;
+		return (
+			gaps.size > 0 &&
+			count >= 1 &&
+			adjacent.filter((k) => index.get(k)?.void).length >= 2 &&
+			surface.variation < 0.14 &&
+			surface.sides[side] >= 0.6 &&
+			surface.cornerEvidence[side] >= 3
+		);
 	});
 	if (tiled.length === 0) throw new Error('No board squares found in the image.');
 	const columns = tiled.map(({ square }) => square.column);
@@ -194,6 +310,27 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 	const [top, bottom] = [Math.min(...rows), Math.max(...rows)];
 	const inside = ({ column, row }: Square): boolean =>
 		column >= left && column <= right && row >= top && row <= bottom;
+	const skySides = [false, false, false, false];
+	if (tiles.photographed) {
+		for (const surface of surfaces) {
+			const { column, row } = surface.square;
+			if (
+				!surface.void ||
+				inside(surface.square) ||
+				!neighbors(surface.square).some((k) => supported.has(k))
+			)
+				continue;
+			if (row >= top && row <= bottom) {
+				if (column < left) skySides[0] = true;
+				if (column > right) skySides[1] = true;
+			}
+			if (column >= left && column <= right) {
+				if (row < top) skySides[2] = true;
+				if (row > bottom) skySides[3] = true;
+			}
+		}
+	}
+	const boundedBySky = skySides.every(Boolean);
 	const visible = new Set(
 		tiled
 			.filter(({ square }) => {
@@ -211,15 +348,31 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 				if (
 					!edge &&
 					!(complete && surface.variation < 0.14) &&
+					!(
+						gaps.size > 0 &&
+						surface.variation < 0.14 &&
+						surface.sides[side] >= 0.6 &&
+						surface.cornerEvidence[side] >= 3
+					) &&
 					neighbors(square).filter((k) => supported.has(k) || index.get(k)?.void).length <
 						3
 				)
 					return false;
 				if (!view.cornerSupport || (!tiles.photographed && !view.embedded)) return true;
-				const corners = squareCorners(square).map((k) => view.cornerSupport!.has(k));
+				const corners = squareCorners(square).map((k) => cornerSupport!.has(k));
 				return (
 					(corners[0] && corners[3]) ||
 					(corners[1] && corners[2]) ||
+					(tiles.photographed &&
+						edge &&
+						(crowdedPalette || boundedBySky) &&
+						surface.sides[side] >= 0.6 &&
+						surface.cornerEvidence[side] >= 2 &&
+						neighbors(square).filter((k) => supported.has(k)).length >= 2) ||
+					(gaps.size > 0 &&
+						surface.sides[side] >= 0.5 &&
+						surface.variation < 0.14 &&
+						surface.cornerEvidence[side] >= 3) ||
 					(surface.sides[side] > 0.4 &&
 						surface.cornerEvidence[side] >= 3 &&
 						neighbors(square).some((k) => index.get(k)?.void))
@@ -234,11 +387,30 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 				(s.void &&
 					inside(s.square) &&
 					(!tiles.photographed ||
+						gaps.has(key(s.square)) ||
 						(neighbors(s.square).filter((k) => visible.has(k)).length >= 3 &&
 							view.cornerSupport &&
 							squareCorners(s.square).every((k) => view.cornerSupport!.has(k))))),
 		)
 		.map(({ square }) => square);
+	if (crowdedPalette) {
+		const exposed = tiled
+			.filter((s) => parity(s.square) === darkParity)
+			.map((s) => s.background);
+		const localDark = exposed.length ? medianColor(exposed) : undefined;
+		// A repeated glyph's gray can replace the dim tile color in the global palette.
+		// Compare sky at a validated outer edge with the exposed tile perimeter itself.
+		for (const surface of surfaces) {
+			if (
+				localDark &&
+				!inside(surface.square) &&
+				surface.skyVariation < 0.14 &&
+				luminance(surface.skyBackground) < 0.8 * luminance(localDark) &&
+				neighbors(surface.square).some((k) => visible.has(k))
+			)
+				surface.void = true;
+		}
+	}
 	let beyond = surfaces.filter((s) => s.void && !inside(s.square)).map(({ square }) => square);
 	if (tiles.photographed) {
 		beyond = beyond.filter((square) => neighbors(square).some((k) => visible.has(k)));
@@ -250,15 +422,53 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 			.map(({ square }) => key(square)),
 	);
 	const included = new Set(squares.map(key));
-	const candidates = !view.perspective
-		? surfaces
-				.filter(({ square }) => inside(square) && !included.has(key(square)))
-				.map(({ square }) => square)
-		: [];
+	const enclosed = tiles.photographed
+		? enclosedSurfaceHoles(surfaces, index, included, foreground, inside)
+		: new Set<string>();
+	const inferred = new Set<string>();
+	const candidates =
+		!view.perspective || tiles.photographed
+			? surfaces
+					.filter((surface) => {
+						const { square } = surface;
+						if (
+							!inside(square) ||
+							included.has(key(square)) ||
+							foreground.has(key(square))
+						)
+							return false;
+						if (!tiles.photographed || gaps.size > 0 || crowdedPalette) return true;
+						// Missing crossings can span adjacent cells. Their component must be
+						// enclosed by observed board surface before the independent appearance
+						// model may examine its contents. Foreground and viewport edges are open.
+						if (enclosed.has(key(square))) {
+							inferred.add(key(square));
+							return true;
+						}
+						const edge =
+							square.column === left ||
+							square.column === right ||
+							square.row === top ||
+							square.row === bottom;
+						if (!edge) return false;
+						const side = parity(square) === darkParity ? 0 : 1;
+						return (
+							surface.tiles[side] >= 0.6 &&
+							surface.sides[side] >= 0.4 &&
+							surface.cornerEvidence[side] >= 2
+						);
+					})
+					.map(({ square }) => square)
+			: [];
 	const neighborCounts = new Map(
 		candidates.map((square) => [
 			key(square),
-			neighbors(square).filter((k) => supported.has(k) || index.get(k)?.void).length,
+			neighbors(square).filter(
+				(k) =>
+					supported.has(k) ||
+					index.get(k)?.void ||
+					(gaps.size > 0 && index.has(k) && inside(index.get(k)!.square)),
+			).length,
 		]),
 	);
 	const tileSquares = surfaces
@@ -271,13 +481,211 @@ export function findBoardRegion(pic: Picture, view: View, tiles: Tiles): BoardRe
 		top: Math.min(...tileSquares.map((s) => s.row)),
 		bottom: Math.max(...tileSquares.map((s) => s.row)),
 	};
-	return { squares, candidates, neighbors: neighborCounts, beyond, voids, darkParity, extent };
+	return {
+		squares,
+		candidates,
+		inferred,
+		neighbors: neighborCounts,
+		beyond,
+		voids,
+		darkParity,
+		extent,
+	};
+}
+
+/** Missing-cell components whose entire boundary is independently visible board surface. */
+function enclosedSurfaceHoles(
+	surfaces: Surface[],
+	index: Map<string, Surface>,
+	visible: Set<string>,
+	foreground: Set<string>,
+	inside: (square: Square) => boolean,
+): Set<string> {
+	const visited = new Set<string>();
+	const enclosed = new Set<string>();
+	for (const { square } of surfaces) {
+		const start = key(square);
+		if (visited.has(start) || visible.has(start) || foreground.has(start) || !inside(square))
+			continue;
+		const component = [start];
+		visited.add(start);
+		let bounded = true;
+		for (let next = 0; next < component.length; next++) {
+			for (const k of neighbors(index.get(component[next]!)!.square)) {
+				if (visible.has(k)) continue;
+				const neighbor = index.get(k);
+				if (!neighbor || !inside(neighbor.square) || foreground.has(k)) {
+					bounded = false;
+					continue;
+				}
+				if (visited.has(k)) continue;
+				visited.add(k);
+				component.push(k);
+			}
+		}
+		if (bounded) for (const k of component) enclosed.add(k);
+	}
+	return enclosed;
+}
+
+/** Crossings established by the alternating backgrounds of four exposed neighboring tiles. */
+function inferredSurfaceCorners(
+	surfaces: Surface[],
+	index: Map<string, Surface>,
+	tiled: Set<string>,
+	darkParity: 0 | 1,
+): Set<string> {
+	const supported = new Set<string>();
+	for (const { square } of surfaces) {
+		const { column, row } = square;
+		const quadrants = [
+			index.get(`${column - 1},${row - 1}`),
+			index.get(`${column},${row - 1}`),
+			index.get(`${column},${row}`),
+			index.get(`${column - 1},${row}`),
+		];
+		if (
+			!quadrants.every(
+				(s) =>
+					s &&
+					tiled.has(key(s.square)) &&
+					s.sides[parity(s.square) === darkParity ? 0 : 1] >= 0.4 &&
+					s.cornerEvidence[parity(s.square) === darkParity ? 0 : 1] >= 2,
+			)
+		)
+			continue;
+		const [a, b, c, d] = quadrants.map((s) => s!.background) as [RGB, RGB, RGB, RGB];
+		const variation = Math.max(colorDistance(a, c), colorDistance(b, d));
+		const contrast = Math.min(colorDistance(a, b), colorDistance(c, d));
+		if (contrast > Math.max(0.04, 1.5 * variation)) supported.add(`${column},${row}`);
+	}
+	return supported;
+}
+
+/**
+ * Repeated, crossing lanes of sky distinguish separated board islands from a foreground panel.
+ * A photograph can tint sky differently from the tiles, and decorations can interrupt a few
+ * samples. Require multiple regularly spaced lanes in both directions before accepting them.
+ */
+function findVoidLanes(surfaces: Surface[], tiled: Set<string>): Set<string> {
+	const supported = surfaces.filter((s) => tiled.has(key(s.square)));
+	if (supported.length === 0) return new Set();
+	const columns = supported.map((s) => s.square.column);
+	const rows = supported.map((s) => s.square.row);
+	const [left, right] = [Math.min(...columns), Math.max(...columns)];
+	const [top, bottom] = [Math.min(...rows), Math.max(...rows)];
+	const index = new Map(surfaces.map((s) => [key(s.square), s]));
+	const brightnesses = new Map<Surface, number>();
+	const nearbyTileBrightness = (s: Surface): number => {
+		const cached = brightnesses.get(s);
+		if (cached !== undefined) return cached;
+		let brightest = -Infinity;
+		for (let dr = -2; dr <= 2; dr++) {
+			for (let dc = -2; dc <= 2; dc++) {
+				const k = `${s.square.column + dc},${s.square.row + dr}`;
+				if (tiled.has(k))
+					brightest = Math.max(brightest, luminance(index.get(k)!.background));
+			}
+		}
+		brightnesses.set(s, brightest);
+		return brightest;
+	};
+	const sky = (s: Surface | undefined): boolean =>
+		!!s &&
+		!tiled.has(key(s.square)) &&
+		s.skyVariation < 0.14 &&
+		luminance(s.skyBackground) < nearbyTileBrightness(s) - 0.15;
+	const laneRows: number[] = [];
+	const laneColumns: number[] = [];
+	for (let row = top + 1; row < bottom; row++) {
+		let count = 0;
+		for (let column = left; column <= right; column++)
+			if (sky(index.get(`${column},${row}`))) count++;
+		if (count >= 0.8 * (right - left + 1)) laneRows.push(row);
+	}
+	for (let column = left + 1; column < right; column++) {
+		let count = 0;
+		for (let row = top; row <= bottom; row++) if (sky(index.get(`${column},${row}`))) count++;
+		if (count >= 0.8 * (bottom - top + 1)) laneColumns.push(column);
+	}
+	const recover = (lanes: number[], from: number, to: number): number[] => {
+		let best: number[] = [];
+		let period = 0;
+		for (let i = 0; i < lanes.length; i++) {
+			for (let j = i + 1; j < lanes.length; j++) {
+				const step = lanes[j]! - lanes[i]!;
+				if (step < 3) continue;
+				const aligned = lanes.filter((v) => (v - lanes[i]!) % step === 0);
+				const expected = (aligned.at(-1)! - aligned[0]!) / step + 1;
+				if (aligned.length < 0.6 * expected || aligned.length <= best.length) continue;
+				best = aligned;
+				period = step;
+			}
+		}
+		if (best.length < 2) return [];
+		const result: number[] = [];
+		for (let value = from + 1; value < to; value++)
+			if ((value - best[0]!) % period === 0) result.push(value);
+		return result;
+	};
+	const rowGaps = recover(laneRows, top, bottom);
+	const columnGaps = recover(laneColumns, left, right);
+	if (rowGaps.length < 2 || columnGaps.length < 2) return new Set();
+	const rowGapSet = new Set(rowGaps);
+	const columnGapSet = new Set(columnGaps);
+	const laneSky = new Map(
+		surfaces
+			.filter(
+				(s) => (rowGapSet.has(s.square.row) || columnGapSet.has(s.square.column)) && sky(s),
+			)
+			.map((s) => [key(s.square), s]),
+	);
+	const gaps = new Set<string>();
+	for (const s of surfaces) {
+		const { column, row } = s.square;
+		const inside = column >= left && column <= right && row >= top && row <= bottom;
+		if (inside && (rowGapSet.has(row) || columnGapSet.has(column))) {
+			if (tiled.has(key(s.square))) continue;
+			if (luminance(s.skyBackground) >= nearbyTileBrightness(s) - 0.08) continue;
+			const near: Surface[] = [];
+			for (let dr = -2; dr <= 2; dr++) {
+				for (let dc = -2; dc <= 2; dc++) {
+					const neighbor = laneSky.get(`${column + dc},${row + dr}`);
+					if (neighbor) near.push(neighbor);
+				}
+			}
+			if (near.length < 2) continue;
+			const skyColor = medianColor(near.map((n) => n.skyBackground));
+			if (colorDistance(s.skyBackground, skyColor) > 0.12) {
+				// The site's sky contains translucent squares in the board theme's colors.
+				// They brighten a cell's center while its perimeter still exposes the sky.
+				if (colorDistance(s.background, skyColor) > 0.12) continue;
+				let decoration = false;
+				for (let dr = -2; dr <= 2; dr++) {
+					for (let dc = -2; dc <= 2; dc++) {
+						const k = `${column + dc},${row + dr}`;
+						if (!tiled.has(k)) continue;
+						const color = index.get(k)!.background;
+						const direction = color.map((v, c) => v - skyColor[c]!);
+						const length = direction.reduce((sum, v) => sum + v * v, 0);
+						const blend = direction.reduce((sum, v, c) => sum + v * (s.skyBackground[c]! - skyColor[c]!), 0) / length; // prettier-ignore
+						const expected = skyColor.map((v, c) => v + blend * direction[c]!) as RGB;
+						if (blend > 0 && blend < 0.8 && colorDistance(s.skyBackground, expected) < 0.06) decoration = true; // prettier-ignore
+					}
+				}
+				if (!decoration) continue;
+			}
+			s.void = true;
+			gaps.add(key(s.square));
+		} else if (!inside && sky(s)) s.void = true;
+	}
+	return gaps;
 }
 
 /** Tile-colored perimeter samples avoid the pieces in a square's interior. */
 function surfaceOf(pic: Picture, view: View, square: Square, tiles: Tiles): Surface {
-	const samples = Math.min(24, Math.max(8, Math.round(square.size)));
-	const margin = square.size >= 14 ? 0.04 : 0;
+	const samples = Math.min(24, Math.max(8, Math.round(square.size / (tiles.photographed ? 2 : 1)))); // prettier-ignore
+	const margin = square.size >= 14 && (!tiles.photographed || square.size >= 30) ? 0.04 : 0;
 	const patch = samplePatch(
 		pic,
 		view.toImage,
@@ -326,6 +734,26 @@ function surfaceOf(pic: Picture, view: View, square: Square, tiles: Tiles): Surf
 	);
 	brightnesses.sort((a, b) => a - b);
 	const variation = brightnesses[Math.floor(interior * 0.95)]! - brightnesses[Math.floor(interior * 0.05)]!; // prettier-ignore
+	const background = medianColor(sides.flat());
+	let skyBackground = background;
+	let skyVariation = variation;
+	if (tiles.photographed) {
+		const skyPatch = samplePatch(
+			pic,
+			view.toImage,
+			[square.column + 0.2, square.row + 0.2],
+			0.6,
+			4,
+		);
+		const skyColors = Array.from({ length: 16 }, (_, i): RGB => [
+			skyPatch[i * 3]!,
+			skyPatch[i * 3 + 1]!,
+			skyPatch[i * 3 + 2]!,
+		]);
+		const skyBrightnesses = skyColors.map(luminance).sort((a, b) => a - b);
+		skyBackground = medianColor(skyColors);
+		skyVariation = skyBrightnesses[15]! - skyBrightnesses[0]!;
+	}
 	const uniform = tiles.photographed
 		? variation < 0.14 && dark >= 0.98 * interior
 		: lightest - darkest < 0.04 && dark === interior;
@@ -342,12 +770,14 @@ function surfaceOf(pic: Picture, view: View, square: Square, tiles: Tiles): Surf
 	return {
 		square,
 		tiles: [evidence[0] / perimeter, evidence[1] / perimeter],
-		background: medianColor(sides.flat()),
+		background,
 		perimeter: sides,
 		sides: sideEvidence.sides,
 		corners,
 		cornerEvidence: cornerEvidence(corners, tiles, tolerance),
 		variation,
+		skyBackground,
+		skyVariation,
 		void:
 			uniform &&
 			(Math.max(...ratios) - Math.min(...ratios) < 0.12 ||
