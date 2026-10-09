@@ -15,6 +15,7 @@ import type { Sprite } from './sprites.js';
 import type { Square, View } from './view.js';
 import type { Tiles } from './tiles.js';
 import type { BoardRegion } from './region.js';
+import type { SampledSquare } from './matcher.js';
 
 import { classify } from './classify.js';
 import { writeIcn } from './icn.js';
@@ -22,7 +23,7 @@ import { findViews } from './view.js';
 import { abbreviate, VOID_CODE } from './pieces.js';
 import { loadPicture } from './picture.js';
 import { findTileColors } from './tiles.js';
-import { findBoardRegion } from './region.js';
+import { findBoardRegion, isObstructed, openRegion } from './region.js';
 import { loadSprites } from './sprites.js';
 import {
 	chooseMatchers,
@@ -73,6 +74,15 @@ export interface Reading {
 
 export type { PlacedPiece, Promotion, WorldBorder } from './icn.js';
 
+/** Where the board sits in a screenshot, which of its squares show, and those squares sampled. */
+interface Board {
+	view: View;
+	region: BoardRegion;
+	sampled: SampledSquare[];
+	/** Whether something covers part of the board: a menu, the browser around it, or a photo's foreground. */
+	obstructed: boolean;
+}
+
 // Constants -------------------------------------------------------------------
 
 /** How many squares, spread across the board's sizes, are searched for orientation evidence. */
@@ -99,31 +109,45 @@ export async function readScreenshot(
 	sprites ??= loadSprites();
 	const pic = await loadPicture(input);
 	const tiles = findTileColors(pic);
-	const { view, region } = chooseView(pic, findViews(pic, tiles), tiles, await sprites);
-	const sampled = sampleSquares(pic, view.pieces.toImage, [
-		...region.squares,
-		...region.candidates,
-	]);
+	const views = findViews(pic, tiles);
+	const open = tiles.photographed ? undefined : openBoard(pic, tiles, views, await sprites);
+	const read = open && readBoard(pic, tiles, open, await sprites, options);
+	if (read && !read.covered) return read.reading;
+	return readBoard(pic, tiles, obstructedBoard(pic, tiles, views, await sprites), await sprites, options).reading; // prettier-ignore
+}
+
+/** Reads a board's position, skipping covered squares, and whether it met any. */
+function readBoard(
+	pic: Picture,
+	tiles: Tiles,
+	{ view, region, sampled, obstructed }: Board,
+	sprites: Sprite[],
+	options: Options,
+): { reading: Reading; covered: boolean } {
 	const direct = new Set(region.squares.map((square) => `${square.column},${square.row}`));
-	const extent = tiles.photographed ? region.extent : findBoardExtent(sampled, tiles);
 	const onBoard = sampled
-		.filter(({ square }) => isWithin(square, extent))
+		.filter(({ square }) => isWithin(square, region.extent))
 		.sort((a, b) => a.square.row - b.square.row || a.square.column - b.square.column);
 	const matchers = chooseMatchers(
-		await sprites,
+		sprites,
 		onBoard.filter(({ square }) => direct.has(`${square.column},${square.row}`)),
 		tiles.photographed,
 	);
-	const reader: Reader = { pic, view, darkTile: tiles[0] };
+	// At an angle, promotion lines reach into the squares beside them, which reads like a cover.
+	const reader: Reader = { pic, view, tiles, detectsCovers: obstructed || !view.perspective };
 	const frame = frameOf(region.squares, region.darkParity, options.perspective === 'black'); // prettier-ignore
 
 	const pieces: PlacedPiece[] = [];
 	const shown = new Set<string>();
 	const accepted: Square[] = [];
+	let covered = false;
 	for (const sampled of onBoard) {
 		const { square } = sampled;
 		const verdict = classify(reader, sampled, matchers);
-		if (verdict.kind === 'obscured') continue;
+		if (verdict.kind === 'obscured') {
+			covered = true;
+			continue;
+		}
 		if (!direct.has(`${square.column},${square.row}`)) {
 			const neighbors = region.neighbors.get(`${square.column},${square.row}`)!;
 			if (
@@ -150,7 +174,7 @@ export async function readScreenshot(
 	}
 
 	const promotion = readPromotion(findPromotionLines(pic, view, accepted, tiles), frame);
-	const worldBorder = readWorldBorder(extent, [...region.squares, ...region.beyond], frame);
+	const worldBorder = readWorldBorder(region.extent, [...region.squares, ...region.beyond], frame); // prettier-ignore
 	const coordinates = [...region.squares, ...region.beyond].map((square): [number, number] => [fileOf(frame, square.column), rankOf(frame, square.row)]); // prettier-ignore
 	const area = {
 		left: Math.min(...coordinates.map(([x]) => x)),
@@ -160,38 +184,54 @@ export async function readScreenshot(
 	};
 	const squareSize = Math.max(...region.squares.map((square) => square.size));
 	const icn = writeIcn(pieces, promotion, worldBorder);
-	return {
-		icn,
-		pieces,
-		promotion,
-		worldBorder,
-		shown,
-		area,
-		squareSize,
-		perspective: view.perspective,
-	};
+	const reading = { icn, pieces, promotion, worldBorder, shown, area, squareSize, perspective: view.perspective }; // prettier-ignore
+	return { reading, covered };
 }
 
-/** Of the ways the board might sit, the one its largest pieces fit best standing as drawn. */
-function chooseView(
+/** The board of a screenshot showing nothing else, read whole, unless something shows covering it. */
+function openBoard(
 	pic: Picture,
-	views: View[],
 	tiles: Tiles,
+	views: View[],
 	sprites: Sprite[],
-): { view: View; region: BoardRegion } {
-	const candidates: { view: View; region: BoardRegion }[] = [];
+): Board | undefined {
+	const { view } = chooseView(pic, views.map((view) => ({ view, squares: view.squares })), tiles, sprites); // prettier-ignore
+	const sampled = sampleSquares(pic, view.pieces.toImage, view.squares);
+	if (isObstructed(sampled, tiles)) return undefined;
+	return { view, region: openRegion(sampled, tiles), sampled, obstructed: false };
+}
+
+/** The board around whatever covers it: menus, the browser around it, or a photo's foreground. */
+function obstructedBoard(pic: Picture, tiles: Tiles, views: View[], sprites: Sprite[]): Board {
+	// Bars around the board move the camera's center off the image's.
+	if (!tiles.photographed && views[0]!.perspective) views = findViews(pic, tiles, true);
+	const candidates: { view: View; squares: Square[]; region: BoardRegion }[] = [];
 	let regionError: unknown;
 	for (const view of views) {
 		try {
-			candidates.push({ view, region: findBoardRegion(pic, view, tiles) });
+			const region = findBoardRegion(pic, view, tiles);
+			candidates.push({ view, squares: region.squares, region });
 		} catch (error) {
 			regionError = error;
 		}
 	}
 	if (candidates.length === 0) throw regionError;
+	const { view, region } = chooseView(pic, candidates, tiles, sprites);
+	const sampled = sampleSquares(pic, view.pieces.toImage, [...region.squares, ...region.candidates]); // prettier-ignore
+	const extent = tiles.photographed ? region.extent : findBoardExtent(sampled, tiles);
+	return { view, region: { ...region, extent }, sampled, obstructed: true };
+}
+
+/** Of the ways the board might sit, the one its largest pieces fit best standing as drawn. */
+function chooseView<T extends { view: View; squares: Square[] }>(
+	pic: Picture,
+	candidates: T[],
+	tiles: Tiles,
+	sprites: Sprite[],
+): T {
 	if (candidates.length === 1) return candidates[0]!;
-	const scores = candidates.map(({ view, region }) => {
-		const ordered = [...region.squares].sort((a, b) => b.size - a.size);
+	const scores = candidates.map(({ view, squares }) => {
+		const ordered = [...squares].sort((a, b) => b.size - a.size);
 		const stride = Math.max(1, Math.floor(ordered.length / ORIENTATION_SEARCH));
 		const largest = ordered
 			.filter((_, index) => index % stride === 0)

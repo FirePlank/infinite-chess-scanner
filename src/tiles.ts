@@ -194,6 +194,11 @@ export function isTileColor(color: RGB, [dark, light]: Tiles): boolean {
 	);
 }
 
+/** Whether a plain square's color is a void's, or the sky's beyond a world border: darker than the dark tile. */
+export function isVoidColor(color: RGB, [dark]: Tiles): boolean {
+	return colorDistance(color, dark) > 0.08 && luminance(color) < 0.8 * luminance(dark);
+}
+
 /** Each pixel's position from the dark (0) to the light (1) tile color, or NaN if it's neither. */
 export function tileShades(pic: Picture, tiles: Tiles): Float32Array {
 	const [dark, light] = tiles;

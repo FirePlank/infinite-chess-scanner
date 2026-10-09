@@ -65,9 +65,9 @@ export function stretch(h: Homography, x: number, y: number): number {
 
 /**
  * The homography of a plane parallel to the one h maps, raised toward the camera by a fraction of
- * the camera's height above it. The camera is taken to look through the image's center with square
- * pixels, or through a supplied viewport center, its focal length calibrated from h. Returns h when it can't calibrate, as when seen
- * straight down or cropped off center.
+ * the camera's height above it. The camera is taken to look through the image's center, or a given
+ * one, with square pixels, its focal length calibrated from h. Returns h when it can't calibrate, as
+ * when seen straight down or cropped off center.
  */
 export function raise(
 	h: Homography,

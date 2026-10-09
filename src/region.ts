@@ -1,6 +1,7 @@
 /**
- * Finds visible board squares independently of the image boundary. A checkerboard can have
- * holes, or several visible islands, when a menu or a foreground object covers its screen.
+ * Which of the board's squares show. Nothing covers most screenshots, which show every square up to
+ * the world border. Menus, the browser around the board or things in front of a photographed
+ * screen can leave holes in the board, or several islands of it, each square judged on its own.
  */
 
 import type { RGB } from './color.js';
@@ -8,10 +9,16 @@ import type { Picture } from './picture.js';
 import type { Tiles } from './tiles.js';
 import type { Square, View } from './view.js';
 import type { Extent } from './board.js';
+import type { SampledSquare } from './matcher.js';
 
 import { colorDistance, luminance } from './color.js';
 import { samplePatch } from './picture.js';
+import { isTileColor, isVoidColor } from './tiles.js';
+import { findBoardExtent, findDarkParity, isWithin } from './board.js';
 
+// Types -----------------------------------------------------------------------
+
+/** What a square's sampled surface shows of the tiles, at its edges and inside. */
 interface Surface {
 	square: Square;
 	/** Fraction of the perimeter showing each tile color. */
@@ -27,6 +34,7 @@ interface Surface {
 	void: boolean;
 }
 
+/** The squares of the board that show, and what borders them. */
 export interface BoardRegion {
 	/** Fully visible squares, including internal voids. */
 	squares: Square[];
@@ -38,9 +46,47 @@ export interface BoardRegion {
 	beyond: Square[];
 	/** Squares whose surface is uniformly dark rather than merely in photographic shadow. */
 	voids: Set<string>;
+	/** Which parity of column + row the dark tiles sit on. */
 	darkParity: 0 | 1;
 	/** Extent of the locally validated tile surface, excluding voids and sky. */
 	extent: Extent;
+}
+
+// Constants -------------------------------------------------------------------
+
+/** How many plain squares showing something other than the board count as it being covered. */
+const OBSTRUCTED_SQUARES = 2;
+
+// Functions -------------------------------------------------------------------
+
+/** Whether something covers part of the board, by plain squares showing neither their tile, a void nor sky. */
+export function isObstructed(sampled: SampledSquare[], tiles: Tiles): boolean {
+	const darkParity = findDarkParity(sampled, tiles);
+	const foreign = sampled.filter(({ square, patch, mean }) => !patch && !showsBoard(square, mean, tiles, darkParity)); // prettier-ignore
+	return foreign.length >= OBSTRUCTED_SQUARES;
+}
+
+/** Whether a plain square shows what the board would there: its own tile, a void, or the sky. */
+function showsBoard(square: Square, mean: RGB, tiles: Tiles, darkParity: 0 | 1): boolean {
+	if (isVoidColor(mean, tiles)) return true;
+	if (!isTileColor(mean, tiles)) return false;
+	const isDark = colorDistance(mean, tiles[0]) < colorDistance(mean, tiles[1]);
+	return isDark === (parity(square) === darkParity);
+}
+
+/** The region of a board nothing covers: every square up to its world border. */
+export function openRegion(sampled: SampledSquare[], tiles: Tiles): BoardRegion {
+	const extent = findBoardExtent(sampled, tiles);
+	const onBoard = sampled.filter(({ square }) => isWithin(square, extent));
+	return {
+		squares: sampled.map(({ square }) => square),
+		candidates: [],
+		neighbors: new Map(),
+		beyond: [],
+		voids: new Set(),
+		darkParity: findDarkParity(onBoard, tiles),
+		extent,
+	};
 }
 
 /** Finds the board surface without imposing a rectangular or connected visible region. */
@@ -284,12 +330,11 @@ function surfaceOf(pic: Picture, view: View, square: Square, tiles: Tiles): Surf
 		? variation < 0.14 && dark >= 0.98 * interior
 		: lightest - darkest < 0.04 && dark === interior;
 	const sideEvidence = perimeterEvidence(sides, tiles, tolerance);
-	const inset = 0;
 	const corners = [
-		[inset, inset],
-		[samples - 1 - inset, inset],
-		[inset, samples - 1 - inset],
-		[samples - 1 - inset, samples - 1 - inset],
+		[0, 0],
+		[samples - 1, 0],
+		[0, samples - 1],
+		[samples - 1, samples - 1],
 	].map(([x, y]) => {
 		const at = (y! * samples + x!) * 3;
 		return [patch[at]!, patch[at + 1]!, patch[at + 2]!] as RGB;
@@ -310,6 +355,7 @@ function surfaceOf(pic: Picture, view: View, square: Square, tiles: Tiles): Surf
 	};
 }
 
+/** How many of a square's corner samples show each tile color. */
 function cornerEvidence(corners: RGB[], tiles: Tiles, tolerance: number): [number, number] {
 	const counts: [number, number] = [0, 0];
 	for (const color of corners) {
@@ -320,6 +366,7 @@ function cornerEvidence(corners: RGB[], tiles: Tiles, tolerance: number): [numbe
 	return counts;
 }
 
+/** The per-channel median of some colors. */
 function medianColor(colors: RGB[]): RGB {
 	return [0, 1, 2].map(
 		(channel) =>
@@ -329,6 +376,7 @@ function medianColor(colors: RGB[]): RGB {
 	) as RGB;
 }
 
+/** The fraction of a square's edge samples showing each tile color: on average, and on its barest side. */
 function perimeterEvidence(
 	sides: RGB[][],
 	tiles: Tiles,
@@ -354,14 +402,17 @@ function perimeterEvidence(
 	};
 }
 
+/** Whether a square's column + row is even (0) or odd (1). */
 function parity({ column, row }: Square): 0 | 1 {
 	return (((column + row) % 2) + 2) % 2 === 0 ? 0 : 1;
 }
 
+/** A square's `column,row` key. */
 function key({ column, row }: Square): string {
 	return `${column},${row}`;
 }
 
+/** The keys of a square's four orthogonal neighbors. */
 function neighbors({ column, row }: Square): string[] {
 	return [
 		`${column - 1},${row}`,
@@ -371,6 +422,7 @@ function neighbors({ column, row }: Square): string[] {
 	];
 }
 
+/** The keys of a square's four corners, as grid intersections. */
 function squareCorners({ column, row }: Square): string[] {
 	return [
 		`${column},${row}`,

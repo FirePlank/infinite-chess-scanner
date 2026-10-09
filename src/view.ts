@@ -90,7 +90,7 @@ const MAX_SQUARES = 20000;
  * way the pieces might stand, for the pieces themselves to tell apart.
  * @throws If there's no checkerboard, or its squares are too small to read.
  */
-export function findViews(pic: Picture, tiles: Tiles): View[] {
+export function findViews(pic: Picture, tiles: Tiles, embedded = false): View[] {
 	const shades = tileShades(pic, tiles);
 	const classes = tileClasses(shades);
 	let grid: Grid | undefined;
@@ -114,7 +114,7 @@ export function findViews(pic: Picture, tiles: Tiles): View[] {
 				homographies = homographies.map((h) => compose(correction, h));
 			}
 		}
-		const center = tiles.photographed ? undefined : viewportCenter(pic, shades);
+		const center = embedded && !tiles.photographed ? viewportCenter(pic, shades) : undefined;
 		const views = homographies.map((toImage) => perspectiveView(pic, toImage, tiles.photographed, center, corners)); // prettier-ignore
 		if (tiles.photographed || isCheckered(pic, tiles, views[0]!)) return views;
 	}
